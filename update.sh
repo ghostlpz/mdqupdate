@@ -1,18 +1,15 @@
 #!/bin/sh
-# VERSION=13.4.0
+# VERSION=13.5.0
 
-echo "🚀 [容器内] 开始执行 OTA 在线升级 (Target: V13.4.0 Filter Update)..."
+echo "🚀 [容器内] 开始执行 V13.5.0 UI 重构升级..."
 
-# 1. 进入工作目录
 cd /app
 
-echo "📂 正在更新核心代码..."
-
-# 2. 更新 Package.json
+# 1. 更新 Package.json
 cat > package.json << 'EOF'
 {
   "name": "madou-omni-system",
-  "version": "13.4.0",
+  "version": "13.5.0",
   "main": "app.js",
   "dependencies": {
     "axios": "^1.6.0",
@@ -28,522 +25,463 @@ cat > package.json << 'EOF'
 }
 EOF
 
-# 3. 更新 ResourceMgr (核心：支持 SQL 动态筛选)
-cat > modules/resource_mgr.js << 'EOF'
-const { pool } = require('./db');
-
-function hexToBase32(hex) {
-    const alphabet = 'abcdefghijklmnopqrstuvwxyz234567';
-    let binary = '';
-    for (let i = 0; i < hex.length; i++) {
-        binary += parseInt(hex[i], 16).toString(2).padStart(4, '0');
-    }
-    let base32 = '';
-    for (let i = 0; i < binary.length; i += 5) {
-        const chunk = binary.substr(i, 5);
-        const index = parseInt(chunk.padEnd(5, '0'), 2);
-        base32 += alphabet[index];
-    }
-    return base32;
-}
-
-const ResourceMgr = {
-    async save(title, link, magnets) {
-        try {
-            await pool.execute(
-                'INSERT IGNORE INTO resources (title, link, magnets) VALUES (?, ?, ?)',
-                [title, link, magnets]
-            );
-            return true;
-        } catch (err) { return false; }
-    },
-    
-    async queryByHash(hash) {
-        if (!hash) return null;
-        try {
-            const inputHash = hash.trim().toLowerCase();
-            const conditions = [
-                `magnet:?xt=urn:btih:${inputHash}`,
-                `magnet:?xt=urn:btih:${inputHash.toUpperCase()}`
-            ];
-            try {
-                const b32 = hexToBase32(inputHash);
-                conditions.push(`magnet:?xt=urn:btih:${b32}`);
-                conditions.push(`magnet:?xt=urn:btih:${b32.toUpperCase()}`);
-            } catch (e) {}
-            const [rows] = await pool.query(
-                'SELECT title, is_renamed FROM resources WHERE magnets IN (?) LIMIT 1',
-                [conditions]
-            );
-            return rows.length > 0 ? rows[0] : null;
-        } catch (err) { return null; }
-    },
-
-    async markAsPushed(id) { try { await pool.query('UPDATE resources SET is_pushed = 1 WHERE id = ?', [id]); } catch (e) {} },
-    async markAsPushedByLink(link) { try { await pool.query('UPDATE resources SET is_pushed = 1 WHERE link = ?', [link]); } catch (e) {} },
-    async markAsRenamedByTitle(title) { try { await pool.query('UPDATE resources SET is_renamed = 1 WHERE title = ?', [title]); } catch (e) {} },
-
-    // 🔥 修改：增加 filters 参数
-    async getList(page, limit, filters = {}) {
-        try {
-            const offset = (page - 1) * limit;
-            
-            // 构建动态 SQL
-            let whereClause = "";
-            const conditions = [];
-            
-            if (filters.pushed === '1') conditions.push("is_pushed = 1");
-            if (filters.pushed === '0') conditions.push("is_pushed = 0");
-            
-            if (filters.renamed === '1') conditions.push("is_renamed = 1");
-            if (filters.renamed === '0') conditions.push("is_renamed = 0");
-            
-            if (conditions.length > 0) {
-                whereClause = " WHERE " + conditions.join(" AND ");
-            }
-
-            const countSql = `SELECT COUNT(*) as total FROM resources${whereClause}`;
-            const [countRows] = await pool.query(countSql);
-            const total = countRows[0].total;
-
-            const dataSql = `SELECT * FROM resources${whereClause} ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}`;
-            const [rows] = await pool.query(dataSql);
-            
-            return { total, data: rows };
-        } catch (err) {
-            console.error(err);
-            return { total: 0, data: [], error: err.message };
-        }
-    },
-
-    async getAllForExport() {
-        try {
-            const [rows] = await pool.query(`SELECT id, title, magnets, created_at, is_pushed, is_renamed FROM resources ORDER BY created_at DESC`);
-            return rows;
-        } catch (err) { return []; }
-    }
-};
-
-module.exports = ResourceMgr;
-EOF
-
-# 4. 更新 API (接收筛选参数)
-cat > routes/api.js << 'EOF'
-const express = require('express');
-const axios = require('axios');
-const router = express.Router();
-const fs = require('fs');
-const { exec } = require('child_process');
-const { HttpsProxyAgent } = require('https-proxy-agent');
-const { Parser } = require('json2csv');
-const Scraper = require('../modules/scraper');
-const Renamer = require('../modules/renamer');
-const Login115 = require('../modules/login_115');
-const ResourceMgr = require('../modules/resource_mgr');
-const AUTH_PASSWORD = process.env.AUTH_PASSWORD || "admin888";
-
-router.get('/check-auth', (req, res) => {
-    const auth = req.headers['authorization'];
-    res.json({ authenticated: auth === AUTH_PASSWORD });
-});
-router.post('/login', (req, res) => {
-    if (req.body.password === AUTH_PASSWORD) res.json({ success: true });
-    else res.json({ success: false, msg: "密码错误" });
-});
-router.post('/config', (req, res) => {
-    global.CONFIG = { ...global.CONFIG, ...req.body };
-    global.saveConfig();
-    res.json({ success: true });
-});
-router.get('/status', (req, res) => {
-    res.json({ config: global.CONFIG, state: Scraper.getState(), renamerState: Renamer.getState(), version: global.CURRENT_VERSION });
-});
-router.get('/115/qr', async (req, res) => {
-    try {
-        const data = await Login115.getQrCode();
-        res.json({ success: true, data });
-    } catch (e) { res.json({ success: false, msg: e.message }); }
-});
-router.get('/115/check', async (req, res) => {
-    const { uid, time, sign } = req.query;
-    const result = await Login115.checkStatus(uid, time, sign);
-    if (result.success && result.cookie) {
-        global.CONFIG.cookie115 = result.cookie;
-        global.saveConfig();
-        res.json({ success: true, msg: "登录成功", cookie: result.cookie });
-    } else { res.json(result); }
-});
-router.post('/start', (req, res) => {
-    const autoDl = req.body.autoDownload === true;
-    Scraper.start(req.body.type === 'full' ? 50000 : 100, "手动", autoDl);
-    res.json({ success: true });
-});
-router.post('/stop', (req, res) => {
-    Scraper.stop();
-    Renamer.stop();
-    res.json({ success: true });
-});
-router.post('/renamer/start', (req, res) => {
-    Renamer.start(parseInt(req.body.pages) || 0, req.body.force === true);
-    res.json({ success: true });
-});
-router.post('/push', async (req, res) => {
-    const magnets = req.body.magnets || [];
-    if (!global.CONFIG.cookie115) return res.json({ success: false, msg: "未登录115" });
-    if (magnets.length === 0) return res.json({ success: false, msg: "未选择任务" });
-    let successCount = 0;
-    try {
-        for (const val of magnets) {
-            const parts = val.split('|');
-            const id = parts[0];
-            const magnet = parts.length > 1 ? parts[1].trim() : parts[0].trim();
-            const postData = `url=${encodeURIComponent(magnet)}`;
-            const result = await axios.post('https://115.com/web/lixian/?ct=lixian&ac=add_task_url', postData, {
-                headers: {
-                    'Cookie': global.CONFIG.cookie115,
-                    'User-Agent': global.CONFIG.userAgent,
-                    'Content-Type': 'application/x-www-form-urlencoded'
-                }
-            });
-            if (result.data && result.data.state) {
-                successCount++;
-                await ResourceMgr.markAsPushed(id);
-            }
-            await new Promise(r => setTimeout(r, 500));
-        }
-        res.json({ success: true, count: successCount });
-    } catch (e) { res.json({ success: false, msg: e.message }); }
-});
-
-// 🔥 修改：传递筛选参数
-router.get('/data', async (req, res) => {
-    const filters = {
-        pushed: req.query.pushed || '',
-        renamed: req.query.renamed || ''
-    };
-    const result = await ResourceMgr.getList(parseInt(req.query.page) || 1, 100, filters);
-    res.json(result);
-});
-
-router.get('/export', async (req, res) => {
-    try {
-        const type = req.query.type || 'page'; 
-        let data = [];
-        if (type === 'all') data = await ResourceMgr.getAllForExport();
-        else {
-            const result = await ResourceMgr.getList(parseInt(req.query.page) || 1, 100);
-            data = result.data;
-        }
-        const parser = new Parser({ fields: ['id', 'title', 'magnets', 'created_at'] });
-        const csv = parser.parse(data);
-        res.header('Content-Type', 'text/csv');
-        res.attachment(`madou_${Date.now()}.csv`);
-        return res.send(csv);
-    } catch (err) { res.status(500).send("Err: " + err.message); }
-});
-
-function compareVersions(v1, v2) {
-    if (!v1 || !v2) return 0;
-    const p1 = v1.split('.').map(Number);
-    const p2 = v2.split('.').map(Number);
-    for (let i = 0; i < Math.max(p1.length, p2.length); i++) {
-        const n1 = p1[i] || 0;
-        const n2 = p2[i] || 0;
-        if (n1 > n2) return 1;
-        if (n1 < n2) return -1;
-    }
-    return 0;
-}
-
-router.post('/system/online-update', async (req, res) => {
-    const updateUrl = global.UPDATE_URL;
-    const options = { timeout: 30000 };
-    if (global.CONFIG.proxy && global.CONFIG.proxy.startsWith('http')) {
-        const agent = new HttpsProxyAgent(global.CONFIG.proxy);
-        options.httpAgent = agent;
-        options.httpsAgent = agent;
-    }
-    const tempScriptPath = '/data/update_temp.sh';
-    const finalScriptPath = '/data/update.sh';
-    try {
-        console.log(`⬇️ 正在检查更新: ${updateUrl}`);
-        const response = await axios({ method: 'get', url: updateUrl, ...options, responseType: 'stream' });
-        const writer = fs.createWriteStream(tempScriptPath);
-        response.data.pipe(writer);
-        writer.on('finish', () => {
-            fs.readFile(tempScriptPath, 'utf8', (err, data) => {
-                if (err) return res.json({ success: false, msg: "无法读取下载的脚本" });
-                const match = data.match(/#\s*VERSION\s*=\s*([0-9\.]+)/);
-                const remoteVersion = match ? match[1] : null;
-                const localVersion = global.CURRENT_VERSION;
-                if (!remoteVersion) return res.json({ success: false, msg: "远程脚本未包含版本号信息" });
-                console.log(`🔍 版本对比: 本地[${localVersion}] vs 云端[${remoteVersion}]`);
-                if (compareVersions(remoteVersion, localVersion) > 0) {
-                    fs.renameSync(tempScriptPath, finalScriptPath);
-                    res.json({ success: true, msg: `发现新版本 V${remoteVersion}，正在升级...` });
-                    setTimeout(() => {
-                        exec(`chmod +x ${finalScriptPath} && sh ${finalScriptPath}`, (error, stdout, stderr) => {
-                            if (error) console.error(`❌ 升级失败: ${error.message}`);
-                            else {
-                                console.log(`✅ 升级日志:\n${stdout}`);
-                                fs.renameSync(finalScriptPath, finalScriptPath + '.bak');
-                                console.log("🔄 重启容器...");
-                                process.exit(0);
-                            }
-                        });
-                    }, 1000);
-                } else {
-                    fs.unlinkSync(tempScriptPath);
-                    res.json({ success: false, msg: `当前已是最新版本 (V${localVersion})` });
-                }
-            });
-        });
-        writer.on('error', (err) => { res.json({ success: false, msg: "文件写入失败" }); });
-    } catch (e) { res.json({ success: false, msg: "连接失败: " + e.message }); }
-});
-module.exports = router;
-EOF
-
-# 5. 更新 UI (增加筛选栏)
+# 2. 更新 UI - 💅 2025 现代设计风格
+mkdir -p public
 cat > public/index.html << 'EOF'
 <!DOCTYPE html>
-<html lang="zh-CN" data-bs-theme="dark">
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Madou Omni V13.4</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Madou Omni Pro</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
-        :root{--bg:#1e1e2f;--card:#27293d;--txt:#e1e1e6;--acc:#e14eca}
-        body{background:var(--bg);color:var(--txt);font-family:sans-serif;margin:0;display:flex}
-        
-        .sidebar{width:240px;background:#000;height:100vh;display:flex;flex-direction:column;border-right:1px solid #333;flex-shrink:0}
-        .sidebar h2{padding:20px;text-align:center;color:var(--acc);margin:0;border-bottom:1px solid #333}
-        .nav-item{padding:15px 20px;cursor:pointer;color:#aaa;text-decoration:none;display:block;transition:0.3s}
-        .nav-item:hover,.nav-item.active{color:var(--acc);background:#ffffff0d;font-weight:bold;border-left:4px solid var(--acc)}
-        
-        .main{flex:1;padding:20px;overflow-y:auto;height:100vh;width:100%}
-        .card{background:var(--card);border-radius:8px;padding:20px;margin-bottom:20px}
-        
-        .log-box{height:350px;background:#111;color:#0f0;font-family:monospace;font-size:12px;overflow-y:scroll;padding:10px;border-radius:4px;white-space: pre-wrap;word-break: break-all;}
-        .log-box .err{color:#f55} .log-box .warn{color:#fb5} .log-box .suc{color:#5f7}
-        
-        .btn{padding:10px 20px;border:none;border-radius:4px;cursor:pointer;color:#fff;font-weight:bold;margin-right:10px}
-        .btn-pri{background:var(--acc)} .btn-dang{background:#d33} .btn-succ{background:#28a745} .btn-warn{background:#ffc107;color:#000}
-        .btn-info{background:#17a2b8;color:#fff}
-        
-        input,textarea,select{background:#111;border:1px solid #444;color:#fff;padding:8px;border-radius:4px;width:100%;box-sizing:border-box;margin-bottom:10px}
-        
-        /* 筛选栏样式 */
-        .filter-bar { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; background: #333; padding: 10px; border-radius: 4px; }
-        .filter-bar label { white-space: nowrap; font-size: 13px; color: #aaa; }
-        .filter-bar select { margin-bottom: 0; width: auto; flex: 1; min-width: 100px; }
+        :root {
+            --primary: #6366f1; /* 靛蓝 */
+            --primary-hover: #4f46e5;
+            --bg-body: #0f172a; /* 深蓝黑 */
+            --bg-sidebar: #1e293b;
+            --bg-card: rgba(30, 41, 59, 0.7); /* 半透明 */
+            --border: rgba(148, 163, 184, 0.1);
+            --text-main: #f8fafc;
+            --text-sub: #94a3b8;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --radius: 12px;
+            --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
 
-        table{width:100%;border-collapse:collapse;table-layout:fixed;} 
-        th,td{text-align:left;padding:10px;border-bottom:1px solid #444;overflow:hidden;text-overflow:ellipsis;vertical-align:middle;}
+        * { box-sizing: border-box; outline: none; -webkit-tap-highlight-color: transparent; }
         
-        .tag { padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; margin-right: 5px; }
-        .tag-push { background: #28a745; color: #fff; }
-        .tag-ren { background: #17a2b8; color: #fff; }
-        
-        #lock{position:fixed;top:0;left:0;width:100%;height:100%;background:#000;z-index:999;display:flex;justify-content:center;align-items:center}
-        #lock .box{background:var(--card);padding:40px;border-radius:10px;width:300px;text-align:center;border:1px solid #444}
-        .hidden{display:none!important}
-        .check-group { display: flex; align-items: center; margin-bottom: 15px; }
-        .check-group input { width: 20px; height: 20px; margin: 0 10px 0 0; }
-        .tbl-chk { width: 18px; height: 18px; cursor: pointer; }
+        body {
+            background-color: var(--bg-body);
+            background-image: radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.15) 0px, transparent 50%),
+                              radial-gradient(at 100% 100%, rgba(16, 185, 129, 0.1) 0px, transparent 50%);
+            background-attachment: fixed;
+            color: var(--text-main);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            margin: 0;
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+        }
 
+        /* === 侧边栏 === */
+        .sidebar {
+            width: 260px;
+            background: var(--bg-sidebar);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            padding: 20px;
+            z-index: 10;
+        }
+
+        .logo {
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--text-main);
+            margin-bottom: 40px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .logo span { color: var(--primary); }
+
+        .nav-item {
+            display: flex;
+            align-items: center;
+            padding: 12px 16px;
+            color: var(--text-sub);
+            text-decoration: none;
+            border-radius: var(--radius);
+            margin-bottom: 8px;
+            transition: all 0.2s;
+            font-weight: 500;
+            cursor: pointer;
+        }
+
+        .nav-item:hover { background: rgba(255,255,255,0.05); color: var(--text-main); }
+        .nav-item.active { 
+            background: var(--primary); 
+            color: white; 
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+        }
+        .nav-icon { margin-right: 12px; font-size: 18px; }
+
+        /* === 主内容区 === */
+        .main {
+            flex: 1;
+            padding: 30px;
+            overflow-y: auto;
+            position: relative;
+        }
+
+        h1 { font-size: 24px; margin: 0 0 20px 0; font-weight: 600; }
+
+        /* === 卡片 === */
+        .card {
+            background: var(--bg-card);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 24px;
+            margin-bottom: 24px;
+            box-shadow: var(--shadow);
+        }
+
+        /* === 按钮 === */
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            color: white;
+            font-size: 14px;
+        }
+        .btn:active { transform: scale(0.98); }
+        .btn-pri { background: var(--primary); }
+        .btn-pri:hover { background: var(--primary-hover); }
+        .btn-succ { background: var(--success); }
+        .btn-dang { background: var(--danger); }
+        .btn-warn { background: var(--warning); color: #000; }
+        .btn-info { background: #3b82f6; }
+
+        /* === 表单元素 === */
+        .input-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 8px; color: var(--text-sub); font-size: 13px; }
+        input, select, textarea {
+            width: 100%;
+            background: rgba(0,0,0,0.2);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px 12px;
+            color: white;
+            font-family: inherit;
+            transition: 0.2s;
+        }
+        input:focus, select:focus, textarea:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+        }
+
+        /* === 日志窗口 === */
+        .log-box {
+            background: #0b1120;
+            border-radius: 8px;
+            padding: 15px;
+            height: 300px;
+            overflow-y: auto;
+            font-family: 'Menlo', 'Monaco', monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            border: 1px solid var(--border);
+        }
+        .log-entry { margin-bottom: 4px; border-bottom: 1px dashed rgba(255,255,255,0.05); padding-bottom: 2px; }
+        .time { color: var(--text-sub); margin-right: 10px; opacity: 0.7; }
+
+        /* === 表格 === */
+        .table-container { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; white-space: nowrap; }
+        th { text-align: left; color: var(--text-sub); padding: 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
+        td { padding: 12px; border-bottom: 1px solid var(--border); color: var(--text-main); font-size: 14px; }
+        tr:last-child td { border-bottom: none; }
+        tr:hover td { background: rgba(255,255,255,0.02); }
+
+        .tag { padding: 4px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; }
+        .tag-push { background: rgba(16, 185, 129, 0.2); color: #34d399; }
+        .tag-ren { background: rgba(59, 130, 246, 0.2); color: #60a5fa; }
+
+        /* === 筛选栏 === */
+        .filter-bar {
+            display: flex;
+            gap: 15px;
+            background: rgba(0,0,0,0.2);
+            padding: 15px;
+            border-radius: 8px;
+            align-items: flex-end;
+            margin-bottom: 20px;
+        }
+        .filter-item { flex: 1; }
+        .filter-item select { margin-bottom: 0; }
+
+        /* === 锁定屏幕 === */
+        #lock { position: fixed; inset: 0; background: rgba(15, 23, 42, 0.95); backdrop-filter: blur(5px); z-index: 999; display: flex; align-items: center; justify-content: center; }
+        .lock-box { background: var(--bg-sidebar); padding: 40px; border-radius: 16px; width: 100%; max-width: 360px; text-align: center; border: 1px solid var(--border); box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1); }
+
+        .hidden { display: none !important; }
+
+        /* === 📱 移动端适配 (App 风格) === */
         @media (max-width: 768px) {
-            body { flex-direction: column; }
-            .sidebar { width: 100%; height: auto; flex-direction: row; flex-wrap: wrap; border-right: none; border-bottom: 2px solid #333; padding-bottom: 5px; justify-content: space-around; }
-            .sidebar h2 { width: 100%; border-bottom: none; padding: 10px; font-size: 18px; }
-            .nav-item { border-left: none !important; border-bottom: 3px solid transparent; padding: 10px 5px; font-size: 13px; flex: 1; text-align: center; white-space: nowrap; }
-            .nav-item.active { border-bottom: 3px solid var(--acc); background: none; color: var(--acc); }
-            .main { padding: 10px; height: auto; overflow: visible; }
-            .card { padding: 15px; }
-            .btn { display: block; width: 100%; margin-bottom: 10px; margin-right: 0; padding: 12px 0; }
-            .card:has(table) { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-            table { min-width: 600px; }
-            #g-status { width: 100%; padding: 10px; font-size: 12px; background: #111; }
-            .filter-bar { flex-direction: column; align-items: stretch; }
+            body { flex-direction: column; height: 100dvh; } /* 动态视口高度 */
+            
+            .sidebar {
+                position: fixed;
+                bottom: 0;
+                left: 0;
+                width: 100%;
+                height: 60px; /* 底部导航栏高度 */
+                flex-direction: row;
+                padding: 0;
+                background: rgba(30, 41, 59, 0.9);
+                backdrop-filter: blur(10px);
+                border-top: 1px solid var(--border);
+                border-right: none;
+                justify-content: space-around;
+                align-items: center;
+                z-index: 100;
+            }
+
+            .logo { display: none; }
+
+            .nav-item {
+                flex-direction: column;
+                gap: 4px;
+                padding: 6px;
+                margin: 0;
+                font-size: 10px;
+                border-radius: 8px;
+                background: none !important;
+                color: var(--text-sub);
+                box-shadow: none !important;
+            }
+            
+            .nav-item.active { color: var(--primary); }
+            .nav-icon { margin: 0; font-size: 20px; }
+
+            .main { padding: 15px; padding-bottom: 80px; } /* 留出底部距离 */
+            
+            .filter-bar { flex-direction: column; gap: 10px; }
+            .filter-item { width: 100%; }
+            
+            .btn { width: 100%; justify-content: center; margin-right: 0; margin-bottom: 10px; }
+            .card-header-actions { flex-direction: column; gap: 10px; }
         }
     </style>
 </head>
 <body>
     <div id="lock">
-        <div class="box">
-            <h2 style="color:#e14eca">🔒 系统锁定</h2>
-            <input type="password" id="pass" placeholder="请输入密码" style="text-align:center;font-size:18px;margin:20px 0">
-            <button class="btn btn-pri" style="width:100%" onclick="login()">解锁</button>
-            <div id="msg" style="color:#f55;margin-top:10px"></div>
+        <div class="lock-box">
+            <div style="font-size:40px;margin-bottom:20px">🔐</div>
+            <h2 style="margin-bottom:20px">系统锁定</h2>
+            <input type="password" id="pass" placeholder="输入访问密码" style="text-align:center;font-size:16px;margin-bottom:20px">
+            <button class="btn btn-pri" style="width:100%" onclick="login()">解锁进入</button>
+            <div id="msg" style="color:var(--danger);margin-top:15px;font-size:14px"></div>
         </div>
     </div>
 
     <div class="sidebar">
-        <h2>🤖 Madou</h2>
-        <a class="nav-item active" onclick="show('scraper')">采集</a>
-        <a class="nav-item" onclick="show('renamer')">整理</a>
-        <a class="nav-item" onclick="show('database')">库</a>
-        <a class="nav-item" onclick="show('settings')">设置</a>
-        <div style="margin-top:auto;padding:20px;text-align:center;color:#666" id="g-status">待机</div>
+        <div class="logo">⚡ Madou<span>Pro</span></div>
+        <a class="nav-item active" onclick="show('scraper')">
+            <span class="nav-icon">🕷️</span> 采集
+        </a>
+        <a class="nav-item" onclick="show('renamer')">
+            <span class="nav-icon">📂</span> 整理
+        </a>
+        <a class="nav-item" onclick="show('database')">
+            <span class="nav-icon">💾</span> 资源库
+        </a>
+        <a class="nav-item" onclick="show('settings')">
+            <span class="nav-icon">⚙️</span> 设置
+        </a>
     </div>
 
     <div class="main">
         <div id="scraper" class="page">
-            <h1>资源采集</h1>
             <div class="card">
-                <div class="check-group">
-                    <input type="checkbox" id="auto-dl">
-                    <label for="auto-dl">📥 采集成功后自动推送到 115 离线下载</label>
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+                    <h1>资源采集</h1>
+                    <div style="font-size:14px;color:var(--text-sub)">今日采集: <span id="stat-scr" style="color:var(--primary);font-weight:bold;font-size:18px">0</span></div>
                 </div>
-                <button class="btn btn-succ" onclick="api('start',{type:'inc', autoDownload: getDlState()})">▶ 增量采集</button>
-                <button class="btn btn-warn" onclick="api('start',{type:'full', autoDownload: getDlState()})">♻️ 全量采集</button>
-                <button class="btn btn-dang" onclick="api('stop')">⏹ 停止</button>
-                <span style="float:right;font-size:20px">本次采集: <b id="stat-scr" style="color:#e14eca">0</b></span>
+                
+                <div class="input-group" style="display:flex;align-items:center;gap:10px;background:rgba(255,255,255,0.05);padding:10px;border-radius:8px;margin-bottom:20px">
+                    <input type="checkbox" id="auto-dl" style="width:20px;height:20px;margin:0">
+                    <label for="auto-dl" style="margin:0;cursor:pointer">启用自动推送 (采集成功后直接发往 115)</label>
+                </div>
+
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+                    <button class="btn btn-succ" onclick="api('start',{type:'inc', autoDownload: getDlState()})">▶ 增量采集 (推荐)</button>
+                    <button class="btn btn-info" onclick="api('start',{type:'full', autoDownload: getDlState()})">♻️ 全量采集</button>
+                </div>
+                <button class="btn btn-dang" style="width:100%" onclick="api('stop')">⏹ 紧急停止</button>
             </div>
-            <div class="card">
-                <h3>实时日志</h3>
-                <div id="log-scr" class="log-box"></div>
+
+            <div class="card" style="padding:0;overflow:hidden">
+                <div style="padding:15px;border-bottom:1px solid var(--border);font-weight:600">📡 实时终端日志</div>
+                <div id="log-scr" class="log-box" style="border:none;border-radius:0"></div>
             </div>
         </div>
 
         <div id="renamer" class="page hidden">
-            <h1>115 整理</h1>
             <div class="card">
-                <label>扫描页数 (0=全部)</label>
-                <input type="number" id="r-pages" value="0">
-                <div class="check-group" style="margin-top:10px">
-                    <input type="checkbox" id="r-force">
-                    <label for="r-force">⚠️ 强制重新整理 (勾选后会处理“已整理”的项目，速度较慢)</label>
+                <h1>115 整理助手</h1>
+                <div class="input-group">
+                    <label>扫描页数 (0 代表全部)</label>
+                    <input type="number" id="r-pages" value="0" placeholder="默认扫描全部">
                 </div>
-                <button class="btn btn-pri" onclick="startRenamer()">▶ 开始整理</button>
-                <button class="btn btn-dang" onclick="api('stop')">⏹ 停止</button>
-                <div style="margin-top:10px">
-                    成功: <b style="color:#5f7" id="stat-suc">0</b> | 
-                    失败: <b style="color:#f55" id="stat-fail">0</b> | 
-                    跳过: <b style="color:#aaa" id="stat-skip">0</b>
+                <div class="input-group" style="display:flex;align-items:center;gap:10px;margin-bottom:20px">
+                    <input type="checkbox" id="r-force" style="width:20px;margin:0">
+                    <label for="r-force" style="margin:0">强制模式 (重新检查已整理项目)</label>
+                </div>
+                
+                <div style="display:flex;gap:10px">
+                    <button class="btn btn-pri" style="flex:1" onclick="startRenamer()">🚀 开始整理</button>
+                    <button class="btn btn-dang" onclick="api('stop')">⏹</button>
+                </div>
+
+                <div style="margin-top:20px;display:flex;justify-content:space-around;text-align:center;background:rgba(0,0,0,0.2);padding:15px;border-radius:8px">
+                    <div><div style="font-size:12px;color:var(--text-sub)">成功</div><div id="stat-suc" style="color:var(--success);font-size:20px;font-weight:bold">0</div></div>
+                    <div><div style="font-size:12px;color:var(--text-sub)">失败</div><div id="stat-fail" style="color:var(--danger);font-size:20px;font-weight:bold">0</div></div>
+                    <div><div style="font-size:12px;color:var(--text-sub)">跳过</div><div id="stat-skip" style="color:var(--text-sub);font-size:20px;font-weight:bold">0</div></div>
                 </div>
             </div>
-            <div class="card">
-                <h3>操作日志</h3>
-                <div id="log-ren" class="log-box"></div>
+            <div class="card" style="padding:0;overflow:hidden">
+                <div style="padding:15px;border-bottom:1px solid var(--border);font-weight:600">🛠️ 整理日志</div>
+                <div id="log-ren" class="log-box" style="border:none;border-radius:0"></div>
             </div>
         </div>
 
         <div id="database" class="page hidden">
-            <h1>已入库资源</h1>
-            <div class="card">
-                <div class="filter-bar">
-                    <label>📥 推送状态:</label>
+            <h1>资源数据库</h1>
+            
+            <div class="filter-bar">
+                <div class="filter-item">
+                    <label>推送状态</label>
                     <select id="filter-push" onchange="loadDb(1)">
                         <option value="">全部</option>
-                        <option value="1">已推送 (115)</option>
-                        <option value="0">未推送</option>
+                        <option value="1">✅ 已推送</option>
+                        <option value="0">⏳ 未推送</option>
                     </select>
-                    
-                    <label>✏️ 整理状态:</label>
+                </div>
+                <div class="filter-item">
+                    <label>整理状态</label>
                     <select id="filter-ren" onchange="loadDb(1)">
                         <option value="">全部</option>
-                        <option value="1">已整理 (改名)</option>
-                        <option value="0">未整理</option>
+                        <option value="1">✨ 已整理</option>
+                        <option value="0">📝 未整理</option>
                     </select>
                 </div>
-
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px">
-                    <div>
-                        <button class="btn btn-pri" style="width:auto" onclick="loadDb(dbPage-1)">◀</button>
-                        <span id="page-info" style="margin:0 10px">第 1 页</span>
-                        <button class="btn btn-pri" style="width:auto" onclick="loadDb(dbPage+1)">▶</button>
-                    </div>
-                    <h3 style="margin:0; color:#e14eca; font-size:16px" id="total-count">📚 0</h3>
-                </div>
-                <div style="float:right; margin-bottom:10px; width:100%">
-                    <button class="btn btn-info" onclick="pushSelected()">📤 推送选中</button>
-                    <button class="btn btn-warn" onclick="window.open(url('/export?type=all'))">导出全部</button>
-                </div>
             </div>
-            <div class="card">
-                <table id="db-tbl">
-                    <thead>
-                        <tr>
-                            <th style="width:30px"><input type="checkbox" class="tbl-chk" onclick="toggleAll(this)"></th>
-                            <th style="width:40px">ID</th>
-                            <th style="width:40%">标题</th>
-                            <th style="width:35%">磁力链</th>
-                            <th style="width:120px">入库时间</th>
-                        </tr>
-                    </thead>
-                    <tbody></tbody>
-                </table>
+
+            <div class="card" style="padding:0;overflow:hidden">
+                <div style="padding:15px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:rgba(0,0,0,0.1)">
+                    <div style="display:flex;gap:10px">
+                        <button class="btn btn-info" style="padding:6px 12px;font-size:12px" onclick="pushSelected()">📤 推送选中</button>
+                        <button class="btn btn-warn" style="padding:6px 12px;font-size:12px" onclick="window.open(url('/export?type=all'))">📥 导出CSV</button>
+                    </div>
+                    <div id="total-count" style="font-size:12px;color:var(--text-sub)">Loading...</div>
+                </div>
+                
+                <div class="table-container">
+                    <table id="db-tbl">
+                        <thead>
+                            <tr>
+                                <th style="width:40px"><input type="checkbox" onclick="toggleAll(this)"></th>
+                                <th style="width:60px">ID</th>
+                                <th>标题</th>
+                                <th>磁力链</th>
+                                <th style="width:140px">时间</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+
+                <div style="padding:15px;display:flex;justify-content:center;gap:20px;align-items:center;border-top:1px solid var(--border)">
+                    <button class="btn btn-pri" onclick="loadDb(dbPage-1)">上一页</button>
+                    <span id="page-info" style="color:var(--text-sub)">1</span>
+                    <button class="btn btn-pri" onclick="loadDb(dbPage+1)">下一页</button>
+                </div>
             </div>
         </div>
 
         <div id="settings" class="page hidden">
-            <h1>设置</h1>
-            <div class="card" style="text-align:center">
-                <button class="btn btn-pri" onclick="showQr()">📱 115 扫码登录</button>
-                <p style="color:#888;margin-top:10px">扫码后 Cookie 自动填充</p>
-            </div>
+            <h1>系统设置</h1>
             
-            <div class="card" style="border-left: 4px solid #e14eca">
-                <div style="display:flex; justify-content:space-between; align-items:center">
-                    <h3>🔄 系统升级</h3>
-                    <span id="cur-ver" style="color:#e14eca; font-weight:bold">V13.4.0</span>
+            <div class="card" style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px">
+                <div style="font-size:48px;margin-bottom:20px">📱</div>
+                <button class="btn btn-pri" style="font-size:16px;padding:12px 30px" onclick="showQr()">扫码登录 115</button>
+                <p style="color:var(--text-sub);margin-top:10px;font-size:13px">使用 115 App 扫码，Cookie 将自动更新</p>
+            </div>
+
+            <div class="card" style="border-left: 4px solid var(--success)">
+                <h3>☁️ 在线升级</h3>
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-top:15px">
+                    <div>
+                        <div style="font-size:13px;color:var(--text-sub)">当前版本</div>
+                        <div id="cur-ver" style="font-size:24px;font-weight:bold;color:var(--text-main)">V13.5.0</div>
+                    </div>
+                    <button class="btn btn-success" onclick="runOnlineUpdate()">检查更新</button>
                 </div>
-                <p style="color:#aaa; font-size:12px; margin-bottom:10px">
-                    升级源: GitHub (ghostlpz/mdqupdate) <br>
-                    系统会自动检测新版本。如果存在更新，将自动下载并重启。
-                </p>
-                <button class="btn btn-warn" onclick="runOnlineUpdate()">☁️ 检查并升级</button>
             </div>
 
             <div class="card">
-                <label>HTTP 代理</label>
-                <input id="cfg-proxy" placeholder="http://...">
-                <label>Cookie</label>
-                <textarea id="cfg-cookie" rows="5"></textarea>
-                <button class="btn btn-pri" onclick="saveCfg()">保存配置</button>
+                <h3>网络配置</h3>
+                <div class="input-group">
+                    <label>HTTP 代理 (例如: http://192.168.1.5:7890)</label>
+                    <input id="cfg-proxy" placeholder="留空则直连">
+                </div>
+                <div class="input-group">
+                    <label>115 Cookie (手动填入)</label>
+                    <textarea id="cfg-cookie" rows="4" placeholder="UID=...; CID=...; SEID=..."></textarea>
+                </div>
+                <button class="btn btn-pri" style="width:100%" onclick="saveCfg()">💾 保存配置</button>
             </div>
         </div>
     </div>
 
-    <div id="modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:#000000cc;z-index:900;justify-content:center;align-items:center">
-        <div style="background:#fff;padding:20px;border-radius:8px;text-align:center">
-            <h3 style="color:#000">115 扫码</h3>
-            <div id="qr-img"></div>
-            <div id="qr-txt" style="color:#000;margin-top:10px">...</div>
-            <button class="btn btn-dang" onclick="document.getElementById('modal').style.display='none'" style="margin-top:10px">关闭</button>
+    <div id="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:1000;justify-content:center;align-items:center;backdrop-filter:blur(5px)">
+        <div class="card" style="width:300px;text-align:center;background:var(--bg-sidebar)">
+            <h3 style="margin-bottom:20px">请使用 115 App 扫码</h3>
+            <div id="qr-img" style="background:white;padding:10px;border-radius:8px;display:inline-block"></div>
+            <div id="qr-txt" style="margin:20px 0;color:var(--warning)">正在加载二维码...</div>
+            <button class="btn btn-sub" onclick="document.getElementById('modal').style.display='none'">关闭</button>
         </div>
     </div>
 
     <script src="js/app.js"></script>
     <script>
-        // 🔥 修改 loadDb 函数，支持筛选
+        // JS 逻辑保持兼容，仅增加 UI 交互
         async function loadDb(p) {
             if(p < 1) return;
             dbPage = p;
-            document.getElementById('page-info').innerText = "第 " + p + " 页";
-            
-            // 获取筛选值
+            document.getElementById('page-info').innerText = p;
             const pushVal = document.getElementById('filter-push').value;
             const renVal = document.getElementById('filter-ren').value;
             
-            // 拼接到 URL
             const res = await request(`data?page=${p}&pushed=${pushVal}&renamed=${renVal}`);
-            
             const tbody = document.querySelector('#db-tbl tbody');
             tbody.innerHTML = '';
-            const headerCheck = document.querySelector('thead .tbl-chk');
-            if(headerCheck) headerCheck.checked = false;
             
             if(res.data) {
-                document.getElementById('total-count').innerText = "📚 总资源: " + (res.total || 0);
+                document.getElementById('total-count').innerText = "总计: " + (res.total || 0);
                 res.data.forEach(r => {
-                    const time = new Date(r.created_at).toLocaleString();
+                    const time = new Date(r.created_at).toLocaleDateString();
                     let tags = "";
-                    if (r.is_pushed) tags += `<span class="tag tag-push">已推</span>`;
+                    if (r.is_pushed) tags += `<span class="tag tag-push">已推</span> `;
                     if (r.is_renamed) tags += `<span class="tag tag-ren">已整</span>`;
                     const chkValue = `${r.id}|${r.magnets}`;
-                    tbody.innerHTML += `<tr><td><input type="checkbox" class="tbl-chk row-chk" value="${chkValue}"></td><td>${r.id}</td><td>${tags} ${r.title}</td><td style="word-break:break-all;font-size:12px;color:#aaa">${r.magnets || ''}</td><td style="font-size:12px;color:#888">${time}</td></tr>`;
+                    // 手机端优化显示
+                    const magnetShort = r.magnets ? r.magnets.substring(0, 15) + '...' : '无';
+                    tbody.innerHTML += `
+                        <tr>
+                            <td><input type="checkbox" class="tbl-chk row-chk" value="${chkValue}"></td>
+                            <td><span style="opacity:0.5">#</span>${r.id}</td>
+                            <td>
+                                <div style="font-weight:500;margin-bottom:4px">${r.title}</div>
+                                <div>${tags}</div>
+                            </td>
+                            <td style="font-family:monospace;font-size:12px;color:var(--text-sub)">${magnetShort}</td>
+                            <td style="font-size:12px;color:var(--text-sub)">${time}</td>
+                        </tr>`;
                 });
             }
         }
@@ -552,12 +490,11 @@ cat > public/index.html << 'EOF'
 </html>
 EOF
 
-echo "📦 正在安装依赖..."
+echo "📦 升级依赖..."
+# 仅安装必要依赖
 npm install --registry=https://registry.npmmirror.com
 
-echo "🔄 正在重启应用..."
-# 对于 Docker 容器，让主进程退出即可触发 Restart
-# Node.js 将在几秒后重启
+echo "🔄 重启应用..."
 kill 1
 
-echo "✅ 升级完成！请稍后刷新浏览器查看 V13.4.0"
+echo "✅ V13.5.0 UI 升级完成！请强制刷新浏览器 (Ctrl+F5)"
