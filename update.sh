@@ -1,18 +1,18 @@
 #!/bin/sh
-# VERSION=13.2.1
+# VERSION=13.4.0
 
-echo "🚀 [容器内] 开始执行 OTA 在线升级 (Target: V13.2.1)..."
+echo "🚀 [容器内] 开始执行 OTA 在线升级 (Target: V13.4.0 Filter Update)..."
 
-# 1. 确保在正确的工作目录
+# 1. 进入工作目录
 cd /app
 
-echo "📂 正在更新系统文件..."
+echo "📂 正在更新核心代码..."
 
-# 2. 更新 Package.json (直接覆盖当前目录文件)
+# 2. 更新 Package.json
 cat > package.json << 'EOF'
 {
   "name": "madou-omni-system",
-  "version": "13.2.1",
+  "version": "13.4.0",
   "main": "app.js",
   "dependencies": {
     "axios": "^1.6.0",
@@ -28,17 +28,290 @@ cat > package.json << 'EOF'
 }
 EOF
 
-# 3. 更新 UI (增加手机适配)
-# 确保目标目录存在
-mkdir -p public
+# 3. 更新 ResourceMgr (核心：支持 SQL 动态筛选)
+cat > modules/resource_mgr.js << 'EOF'
+const { pool } = require('./db');
 
+function hexToBase32(hex) {
+    const alphabet = 'abcdefghijklmnopqrstuvwxyz234567';
+    let binary = '';
+    for (let i = 0; i < hex.length; i++) {
+        binary += parseInt(hex[i], 16).toString(2).padStart(4, '0');
+    }
+    let base32 = '';
+    for (let i = 0; i < binary.length; i += 5) {
+        const chunk = binary.substr(i, 5);
+        const index = parseInt(chunk.padEnd(5, '0'), 2);
+        base32 += alphabet[index];
+    }
+    return base32;
+}
+
+const ResourceMgr = {
+    async save(title, link, magnets) {
+        try {
+            await pool.execute(
+                'INSERT IGNORE INTO resources (title, link, magnets) VALUES (?, ?, ?)',
+                [title, link, magnets]
+            );
+            return true;
+        } catch (err) { return false; }
+    },
+    
+    async queryByHash(hash) {
+        if (!hash) return null;
+        try {
+            const inputHash = hash.trim().toLowerCase();
+            const conditions = [
+                `magnet:?xt=urn:btih:${inputHash}`,
+                `magnet:?xt=urn:btih:${inputHash.toUpperCase()}`
+            ];
+            try {
+                const b32 = hexToBase32(inputHash);
+                conditions.push(`magnet:?xt=urn:btih:${b32}`);
+                conditions.push(`magnet:?xt=urn:btih:${b32.toUpperCase()}`);
+            } catch (e) {}
+            const [rows] = await pool.query(
+                'SELECT title, is_renamed FROM resources WHERE magnets IN (?) LIMIT 1',
+                [conditions]
+            );
+            return rows.length > 0 ? rows[0] : null;
+        } catch (err) { return null; }
+    },
+
+    async markAsPushed(id) { try { await pool.query('UPDATE resources SET is_pushed = 1 WHERE id = ?', [id]); } catch (e) {} },
+    async markAsPushedByLink(link) { try { await pool.query('UPDATE resources SET is_pushed = 1 WHERE link = ?', [link]); } catch (e) {} },
+    async markAsRenamedByTitle(title) { try { await pool.query('UPDATE resources SET is_renamed = 1 WHERE title = ?', [title]); } catch (e) {} },
+
+    // 🔥 修改：增加 filters 参数
+    async getList(page, limit, filters = {}) {
+        try {
+            const offset = (page - 1) * limit;
+            
+            // 构建动态 SQL
+            let whereClause = "";
+            const conditions = [];
+            
+            if (filters.pushed === '1') conditions.push("is_pushed = 1");
+            if (filters.pushed === '0') conditions.push("is_pushed = 0");
+            
+            if (filters.renamed === '1') conditions.push("is_renamed = 1");
+            if (filters.renamed === '0') conditions.push("is_renamed = 0");
+            
+            if (conditions.length > 0) {
+                whereClause = " WHERE " + conditions.join(" AND ");
+            }
+
+            const countSql = `SELECT COUNT(*) as total FROM resources${whereClause}`;
+            const [countRows] = await pool.query(countSql);
+            const total = countRows[0].total;
+
+            const dataSql = `SELECT * FROM resources${whereClause} ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}`;
+            const [rows] = await pool.query(dataSql);
+            
+            return { total, data: rows };
+        } catch (err) {
+            console.error(err);
+            return { total: 0, data: [], error: err.message };
+        }
+    },
+
+    async getAllForExport() {
+        try {
+            const [rows] = await pool.query(`SELECT id, title, magnets, created_at, is_pushed, is_renamed FROM resources ORDER BY created_at DESC`);
+            return rows;
+        } catch (err) { return []; }
+    }
+};
+
+module.exports = ResourceMgr;
+EOF
+
+# 4. 更新 API (接收筛选参数)
+cat > routes/api.js << 'EOF'
+const express = require('express');
+const axios = require('axios');
+const router = express.Router();
+const fs = require('fs');
+const { exec } = require('child_process');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+const { Parser } = require('json2csv');
+const Scraper = require('../modules/scraper');
+const Renamer = require('../modules/renamer');
+const Login115 = require('../modules/login_115');
+const ResourceMgr = require('../modules/resource_mgr');
+const AUTH_PASSWORD = process.env.AUTH_PASSWORD || "admin888";
+
+router.get('/check-auth', (req, res) => {
+    const auth = req.headers['authorization'];
+    res.json({ authenticated: auth === AUTH_PASSWORD });
+});
+router.post('/login', (req, res) => {
+    if (req.body.password === AUTH_PASSWORD) res.json({ success: true });
+    else res.json({ success: false, msg: "密码错误" });
+});
+router.post('/config', (req, res) => {
+    global.CONFIG = { ...global.CONFIG, ...req.body };
+    global.saveConfig();
+    res.json({ success: true });
+});
+router.get('/status', (req, res) => {
+    res.json({ config: global.CONFIG, state: Scraper.getState(), renamerState: Renamer.getState(), version: global.CURRENT_VERSION });
+});
+router.get('/115/qr', async (req, res) => {
+    try {
+        const data = await Login115.getQrCode();
+        res.json({ success: true, data });
+    } catch (e) { res.json({ success: false, msg: e.message }); }
+});
+router.get('/115/check', async (req, res) => {
+    const { uid, time, sign } = req.query;
+    const result = await Login115.checkStatus(uid, time, sign);
+    if (result.success && result.cookie) {
+        global.CONFIG.cookie115 = result.cookie;
+        global.saveConfig();
+        res.json({ success: true, msg: "登录成功", cookie: result.cookie });
+    } else { res.json(result); }
+});
+router.post('/start', (req, res) => {
+    const autoDl = req.body.autoDownload === true;
+    Scraper.start(req.body.type === 'full' ? 50000 : 100, "手动", autoDl);
+    res.json({ success: true });
+});
+router.post('/stop', (req, res) => {
+    Scraper.stop();
+    Renamer.stop();
+    res.json({ success: true });
+});
+router.post('/renamer/start', (req, res) => {
+    Renamer.start(parseInt(req.body.pages) || 0, req.body.force === true);
+    res.json({ success: true });
+});
+router.post('/push', async (req, res) => {
+    const magnets = req.body.magnets || [];
+    if (!global.CONFIG.cookie115) return res.json({ success: false, msg: "未登录115" });
+    if (magnets.length === 0) return res.json({ success: false, msg: "未选择任务" });
+    let successCount = 0;
+    try {
+        for (const val of magnets) {
+            const parts = val.split('|');
+            const id = parts[0];
+            const magnet = parts.length > 1 ? parts[1].trim() : parts[0].trim();
+            const postData = `url=${encodeURIComponent(magnet)}`;
+            const result = await axios.post('https://115.com/web/lixian/?ct=lixian&ac=add_task_url', postData, {
+                headers: {
+                    'Cookie': global.CONFIG.cookie115,
+                    'User-Agent': global.CONFIG.userAgent,
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                }
+            });
+            if (result.data && result.data.state) {
+                successCount++;
+                await ResourceMgr.markAsPushed(id);
+            }
+            await new Promise(r => setTimeout(r, 500));
+        }
+        res.json({ success: true, count: successCount });
+    } catch (e) { res.json({ success: false, msg: e.message }); }
+});
+
+// 🔥 修改：传递筛选参数
+router.get('/data', async (req, res) => {
+    const filters = {
+        pushed: req.query.pushed || '',
+        renamed: req.query.renamed || ''
+    };
+    const result = await ResourceMgr.getList(parseInt(req.query.page) || 1, 100, filters);
+    res.json(result);
+});
+
+router.get('/export', async (req, res) => {
+    try {
+        const type = req.query.type || 'page'; 
+        let data = [];
+        if (type === 'all') data = await ResourceMgr.getAllForExport();
+        else {
+            const result = await ResourceMgr.getList(parseInt(req.query.page) || 1, 100);
+            data = result.data;
+        }
+        const parser = new Parser({ fields: ['id', 'title', 'magnets', 'created_at'] });
+        const csv = parser.parse(data);
+        res.header('Content-Type', 'text/csv');
+        res.attachment(`madou_${Date.now()}.csv`);
+        return res.send(csv);
+    } catch (err) { res.status(500).send("Err: " + err.message); }
+});
+
+function compareVersions(v1, v2) {
+    if (!v1 || !v2) return 0;
+    const p1 = v1.split('.').map(Number);
+    const p2 = v2.split('.').map(Number);
+    for (let i = 0; i < Math.max(p1.length, p2.length); i++) {
+        const n1 = p1[i] || 0;
+        const n2 = p2[i] || 0;
+        if (n1 > n2) return 1;
+        if (n1 < n2) return -1;
+    }
+    return 0;
+}
+
+router.post('/system/online-update', async (req, res) => {
+    const updateUrl = global.UPDATE_URL;
+    const options = { timeout: 30000 };
+    if (global.CONFIG.proxy && global.CONFIG.proxy.startsWith('http')) {
+        const agent = new HttpsProxyAgent(global.CONFIG.proxy);
+        options.httpAgent = agent;
+        options.httpsAgent = agent;
+    }
+    const tempScriptPath = '/data/update_temp.sh';
+    const finalScriptPath = '/data/update.sh';
+    try {
+        console.log(`⬇️ 正在检查更新: ${updateUrl}`);
+        const response = await axios({ method: 'get', url: updateUrl, ...options, responseType: 'stream' });
+        const writer = fs.createWriteStream(tempScriptPath);
+        response.data.pipe(writer);
+        writer.on('finish', () => {
+            fs.readFile(tempScriptPath, 'utf8', (err, data) => {
+                if (err) return res.json({ success: false, msg: "无法读取下载的脚本" });
+                const match = data.match(/#\s*VERSION\s*=\s*([0-9\.]+)/);
+                const remoteVersion = match ? match[1] : null;
+                const localVersion = global.CURRENT_VERSION;
+                if (!remoteVersion) return res.json({ success: false, msg: "远程脚本未包含版本号信息" });
+                console.log(`🔍 版本对比: 本地[${localVersion}] vs 云端[${remoteVersion}]`);
+                if (compareVersions(remoteVersion, localVersion) > 0) {
+                    fs.renameSync(tempScriptPath, finalScriptPath);
+                    res.json({ success: true, msg: `发现新版本 V${remoteVersion}，正在升级...` });
+                    setTimeout(() => {
+                        exec(`chmod +x ${finalScriptPath} && sh ${finalScriptPath}`, (error, stdout, stderr) => {
+                            if (error) console.error(`❌ 升级失败: ${error.message}`);
+                            else {
+                                console.log(`✅ 升级日志:\n${stdout}`);
+                                fs.renameSync(finalScriptPath, finalScriptPath + '.bak');
+                                console.log("🔄 重启容器...");
+                                process.exit(0);
+                            }
+                        });
+                    }, 1000);
+                } else {
+                    fs.unlinkSync(tempScriptPath);
+                    res.json({ success: false, msg: `当前已是最新版本 (V${localVersion})` });
+                }
+            });
+        });
+        writer.on('error', (err) => { res.json({ success: false, msg: "文件写入失败" }); });
+    } catch (e) { res.json({ success: false, msg: "连接失败: " + e.message }); }
+});
+module.exports = router;
+EOF
+
+# 5. 更新 UI (增加筛选栏)
 cat > public/index.html << 'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN" data-bs-theme="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Madou Omni V13.2.1 Mobile</title>
+    <title>Madou Omni V13.4</title>
     <style>
         :root{--bg:#1e1e2f;--card:#27293d;--txt:#e1e1e6;--acc:#e14eca}
         body{background:var(--bg);color:var(--txt);font-family:sans-serif;margin:0;display:flex}
@@ -58,7 +331,13 @@ cat > public/index.html << 'EOF'
         .btn-pri{background:var(--acc)} .btn-dang{background:#d33} .btn-succ{background:#28a745} .btn-warn{background:#ffc107;color:#000}
         .btn-info{background:#17a2b8;color:#fff}
         
-        input,textarea{background:#111;border:1px solid #444;color:#fff;padding:8px;border-radius:4px;width:100%;box-sizing:border-box;margin-bottom:10px}
+        input,textarea,select{background:#111;border:1px solid #444;color:#fff;padding:8px;border-radius:4px;width:100%;box-sizing:border-box;margin-bottom:10px}
+        
+        /* 筛选栏样式 */
+        .filter-bar { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; background: #333; padding: 10px; border-radius: 4px; }
+        .filter-bar label { white-space: nowrap; font-size: 13px; color: #aaa; }
+        .filter-bar select { margin-bottom: 0; width: auto; flex: 1; min-width: 100px; }
+
         table{width:100%;border-collapse:collapse;table-layout:fixed;} 
         th,td{text-align:left;padding:10px;border-bottom:1px solid #444;overflow:hidden;text-overflow:ellipsis;vertical-align:middle;}
         
@@ -73,7 +352,6 @@ cat > public/index.html << 'EOF'
         .check-group input { width: 20px; height: 20px; margin: 0 10px 0 0; }
         .tbl-chk { width: 18px; height: 18px; cursor: pointer; }
 
-        /* 🔥 手机端适配 */
         @media (max-width: 768px) {
             body { flex-direction: column; }
             .sidebar { width: 100%; height: auto; flex-direction: row; flex-wrap: wrap; border-right: none; border-bottom: 2px solid #333; padding-bottom: 5px; justify-content: space-around; }
@@ -86,6 +364,7 @@ cat > public/index.html << 'EOF'
             .card:has(table) { overflow-x: auto; -webkit-overflow-scrolling: touch; }
             table { min-width: 600px; }
             #g-status { width: 100%; padding: 10px; font-size: 12px; background: #111; }
+            .filter-bar { flex-direction: column; align-items: stretch; }
         }
     </style>
 </head>
@@ -153,6 +432,22 @@ cat > public/index.html << 'EOF'
         <div id="database" class="page hidden">
             <h1>已入库资源</h1>
             <div class="card">
+                <div class="filter-bar">
+                    <label>📥 推送状态:</label>
+                    <select id="filter-push" onchange="loadDb(1)">
+                        <option value="">全部</option>
+                        <option value="1">已推送 (115)</option>
+                        <option value="0">未推送</option>
+                    </select>
+                    
+                    <label>✏️ 整理状态:</label>
+                    <select id="filter-ren" onchange="loadDb(1)">
+                        <option value="">全部</option>
+                        <option value="1">已整理 (改名)</option>
+                        <option value="0">未整理</option>
+                    </select>
+                </div>
+
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px">
                     <div>
                         <button class="btn btn-pri" style="width:auto" onclick="loadDb(dbPage-1)">◀</button>
@@ -192,7 +487,7 @@ cat > public/index.html << 'EOF'
             <div class="card" style="border-left: 4px solid #e14eca">
                 <div style="display:flex; justify-content:space-between; align-items:center">
                     <h3>🔄 系统升级</h3>
-                    <span id="cur-ver" style="color:#e14eca; font-weight:bold">V13.2.1</span>
+                    <span id="cur-ver" style="color:#e14eca; font-weight:bold">V13.4.0</span>
                 </div>
                 <p style="color:#aaa; font-size:12px; margin-bottom:10px">
                     升级源: GitHub (ghostlpz/mdqupdate) <br>
@@ -221,13 +516,48 @@ cat > public/index.html << 'EOF'
     </div>
 
     <script src="js/app.js"></script>
+    <script>
+        // 🔥 修改 loadDb 函数，支持筛选
+        async function loadDb(p) {
+            if(p < 1) return;
+            dbPage = p;
+            document.getElementById('page-info').innerText = "第 " + p + " 页";
+            
+            // 获取筛选值
+            const pushVal = document.getElementById('filter-push').value;
+            const renVal = document.getElementById('filter-ren').value;
+            
+            // 拼接到 URL
+            const res = await request(`data?page=${p}&pushed=${pushVal}&renamed=${renVal}`);
+            
+            const tbody = document.querySelector('#db-tbl tbody');
+            tbody.innerHTML = '';
+            const headerCheck = document.querySelector('thead .tbl-chk');
+            if(headerCheck) headerCheck.checked = false;
+            
+            if(res.data) {
+                document.getElementById('total-count').innerText = "📚 总资源: " + (res.total || 0);
+                res.data.forEach(r => {
+                    const time = new Date(r.created_at).toLocaleString();
+                    let tags = "";
+                    if (r.is_pushed) tags += `<span class="tag tag-push">已推</span>`;
+                    if (r.is_renamed) tags += `<span class="tag tag-ren">已整</span>`;
+                    const chkValue = `${r.id}|${r.magnets}`;
+                    tbody.innerHTML += `<tr><td><input type="checkbox" class="tbl-chk row-chk" value="${chkValue}"></td><td>${r.id}</td><td>${tags} ${r.title}</td><td style="word-break:break-all;font-size:12px;color:#aaa">${r.magnets || ''}</td><td style="font-size:12px;color:#888">${time}</td></tr>`;
+                });
+            }
+        }
+    </script>
 </body>
 </html>
 EOF
 
 echo "📦 正在安装依赖..."
-# 注意：容器内没有 docker 命令，直接运行 npm
-# 使用国内源加速
 npm install --registry=https://registry.npmmirror.com
 
-echo "✅ 升级完成！脚本退出后容器将自动重启..."
+echo "🔄 正在重启应用..."
+# 对于 Docker 容器，让主进程退出即可触发 Restart
+# Node.js 将在几秒后重启
+kill 1
+
+echo "✅ 升级完成！请稍后刷新浏览器查看 V13.4.0"
