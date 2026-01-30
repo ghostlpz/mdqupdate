@@ -1,18 +1,15 @@
-#!/bin/bash
+#!/bin/sh
 # VERSION=13.2.1
 
-echo "🚀 开始执行 OTA 在线升级 (Target: V13.2.1 Mobile UI)..."
+echo "🚀 [容器内] 开始执行 OTA 在线升级 (Target: V13.2.1)..."
 
-# 1. 安全检查
-if [ ! -f "docker-compose.yml" ]; then
-    echo "❌ 错误: 未找到 docker-compose.yml，请在项目根目录运行升级。"
-    exit 1
-fi
+# 1. 确保在正确的工作目录
+cd /app
 
 echo "📂 正在更新系统文件..."
 
-# 2. 更新 Package.json (标记为 13.2.1)
-cat > app/package.json << 'EOF'
+# 2. 更新 Package.json (直接覆盖当前目录文件)
+cat > package.json << 'EOF'
 {
   "name": "madou-omni-system",
   "version": "13.2.1",
@@ -31,8 +28,11 @@ cat > app/package.json << 'EOF'
 }
 EOF
 
-# 3. 更新 UI (增加手机适配，并把界面版本号改为 V13.2.1)
-cat > app/public/index.html << 'EOF'
+# 3. 更新 UI (增加手机适配)
+# 确保目标目录存在
+mkdir -p public
+
+cat > public/index.html << 'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN" data-bs-theme="dark">
 <head>
@@ -43,7 +43,6 @@ cat > app/public/index.html << 'EOF'
         :root{--bg:#1e1e2f;--card:#27293d;--txt:#e1e1e6;--acc:#e14eca}
         body{background:var(--bg);color:var(--txt);font-family:sans-serif;margin:0;display:flex}
         
-        /* 桌面端默认样式 */
         .sidebar{width:240px;background:#000;height:100vh;display:flex;flex-direction:column;border-right:1px solid #333;flex-shrink:0}
         .sidebar h2{padding:20px;text-align:center;color:var(--acc);margin:0;border-bottom:1px solid #333}
         .nav-item{padding:15px 20px;cursor:pointer;color:#aaa;text-decoration:none;display:block;transition:0.3s}
@@ -74,7 +73,7 @@ cat > app/public/index.html << 'EOF'
         .check-group input { width: 20px; height: 20px; margin: 0 10px 0 0; }
         .tbl-chk { width: 18px; height: 18px; cursor: pointer; }
 
-        /* 🔥 手机端自适应 */
+        /* 🔥 手机端适配 */
         @media (max-width: 768px) {
             body { flex-direction: column; }
             .sidebar { width: 100%; height: auto; flex-direction: row; flex-wrap: wrap; border-right: none; border-bottom: 2px solid #333; padding-bottom: 5px; justify-content: space-around; }
@@ -173,8 +172,8 @@ cat > app/public/index.html << 'EOF'
                         <tr>
                             <th style="width:30px"><input type="checkbox" class="tbl-chk" onclick="toggleAll(this)"></th>
                             <th style="width:40px">ID</th>
-                            <th style="width:150px">标题</th>
-                            <th style="width:150px">磁力链</th>
+                            <th style="width:40%">标题</th>
+                            <th style="width:35%">磁力链</th>
                             <th style="width:120px">入库时间</th>
                         </tr>
                     </thead>
@@ -227,9 +226,8 @@ cat > app/public/index.html << 'EOF'
 EOF
 
 echo "📦 正在安装依赖..."
-docker-compose exec -T app npm install --no-audit --no-fund
+# 注意：容器内没有 docker 命令，直接运行 npm
+# 使用国内源加速
+npm install --registry=https://registry.npmmirror.com
 
-echo "🔄 正在重启应用..."
-docker-compose restart app
-
-echo "✅ 升级完成！请刷新浏览器查看 V13.2.1"
+echo "✅ 升级完成！脚本退出后容器将自动重启..."
