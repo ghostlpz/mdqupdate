@@ -1,7 +1,7 @@
 #!/bin/bash
-# VERSION=13.2.0
+# VERSION=13.2.1
 
-echo "🚀 开始执行 OTA 在线升级 (Target: V13.2.0 Mobile)..."
+echo "🚀 开始执行 OTA 在线升级 (Target: V13.2.1 Mobile UI)..."
 
 # 1. 安全检查
 if [ ! -f "docker-compose.yml" ]; then
@@ -11,11 +11,11 @@ fi
 
 echo "📂 正在更新系统文件..."
 
-# 2. 更新 Package.json (标记新版本)
+# 2. 更新 Package.json (标记为 13.2.1)
 cat > app/package.json << 'EOF'
 {
   "name": "madou-omni-system",
-  "version": "13.2.0",
+  "version": "13.2.1",
   "main": "app.js",
   "dependencies": {
     "axios": "^1.6.0",
@@ -31,19 +31,19 @@ cat > app/package.json << 'EOF'
 }
 EOF
 
-# 3. 更新 UI (核心：增加手机端 CSS 适配)
+# 3. 更新 UI (增加手机适配，并把界面版本号改为 V13.2.1)
 cat > app/public/index.html << 'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN" data-bs-theme="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Madou Omni V13.2 Mobile</title>
+    <title>Madou Omni V13.2.1 Mobile</title>
     <style>
         :root{--bg:#1e1e2f;--card:#27293d;--txt:#e1e1e6;--acc:#e14eca}
         body{background:var(--bg);color:var(--txt);font-family:sans-serif;margin:0;display:flex}
         
-        /* === 桌面端默认样式 === */
+        /* 桌面端默认样式 */
         .sidebar{width:240px;background:#000;height:100vh;display:flex;flex-direction:column;border-right:1px solid #333;flex-shrink:0}
         .sidebar h2{padding:20px;text-align:center;color:var(--acc);margin:0;border-bottom:1px solid #333}
         .nav-item{padding:15px 20px;cursor:pointer;color:#aaa;text-decoration:none;display:block;transition:0.3s}
@@ -74,50 +74,18 @@ cat > app/public/index.html << 'EOF'
         .check-group input { width: 20px; height: 20px; margin: 0 10px 0 0; }
         .tbl-chk { width: 18px; height: 18px; cursor: pointer; }
 
-        /* 🔥🔥🔥 核心：手机端自适应 CSS 🔥🔥🔥 */
+        /* 🔥 手机端自适应 */
         @media (max-width: 768px) {
             body { flex-direction: column; }
-            
-            /* 侧边栏变顶部导航 */
-            .sidebar { 
-                width: 100%; 
-                height: auto; 
-                flex-direction: row; 
-                flex-wrap: wrap; 
-                border-right: none; 
-                border-bottom: 2px solid #333; 
-                padding-bottom: 5px;
-                justify-content: space-around;
-            }
+            .sidebar { width: 100%; height: auto; flex-direction: row; flex-wrap: wrap; border-right: none; border-bottom: 2px solid #333; padding-bottom: 5px; justify-content: space-around; }
             .sidebar h2 { width: 100%; border-bottom: none; padding: 10px; font-size: 18px; }
-            
-            /* 导航按钮美化 */
-            .nav-item { 
-                border-left: none !important; 
-                border-bottom: 3px solid transparent; 
-                padding: 10px 5px; 
-                font-size: 13px; 
-                flex: 1; 
-                text-align: center;
-                white-space: nowrap;
-            }
-            .nav-item.active { 
-                border-bottom: 3px solid var(--acc); 
-                background: none; 
-                color: var(--acc);
-            }
-            
+            .nav-item { border-left: none !important; border-bottom: 3px solid transparent; padding: 10px 5px; font-size: 13px; flex: 1; text-align: center; white-space: nowrap; }
+            .nav-item.active { border-bottom: 3px solid var(--acc); background: none; color: var(--acc); }
             .main { padding: 10px; height: auto; overflow: visible; }
             .card { padding: 15px; }
-            
-            /* 按钮竖排适配 */
             .btn { display: block; width: 100%; margin-bottom: 10px; margin-right: 0; padding: 12px 0; }
-            
-            /* 表格横向滚动 (防止撑破屏幕) */
             .card:has(table) { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-            table { min-width: 600px; } /* 强制表格宽度，触发滚动 */
-            
-            /* 状态栏 */
+            table { min-width: 600px; }
             #g-status { width: 100%; padding: 10px; font-size: 12px; background: #111; }
         }
     </style>
@@ -134,9 +102,9 @@ cat > app/public/index.html << 'EOF'
 
     <div class="sidebar">
         <h2>🤖 Madou</h2>
-        <a class="nav-item active" onclick="show('scraper')">资源采集</a>
-        <a class="nav-item" onclick="show('renamer')">115 整理</a>
-        <a class="nav-item" onclick="show('database')">资源库</a>
+        <a class="nav-item active" onclick="show('scraper')">采集</a>
+        <a class="nav-item" onclick="show('renamer')">整理</a>
+        <a class="nav-item" onclick="show('database')">库</a>
         <a class="nav-item" onclick="show('settings')">设置</a>
         <div style="margin-top:auto;padding:20px;text-align:center;color:#666" id="g-status">待机</div>
     </div>
@@ -192,10 +160,10 @@ cat > app/public/index.html << 'EOF'
                         <span id="page-info" style="margin:0 10px">第 1 页</span>
                         <button class="btn btn-pri" style="width:auto" onclick="loadDb(dbPage+1)">▶</button>
                     </div>
-                    <h3 style="margin:0; color:#e14eca; font-size:16px" id="total-count">📚 总资源: 0</h3>
+                    <h3 style="margin:0; color:#e14eca; font-size:16px" id="total-count">📚 0</h3>
                 </div>
                 <div style="float:right; margin-bottom:10px; width:100%">
-                    <button class="btn btn-info" onclick="pushSelected()">📤 推送选中到 115</button>
+                    <button class="btn btn-info" onclick="pushSelected()">📤 推送选中</button>
                     <button class="btn btn-warn" onclick="window.open(url('/export?type=all'))">导出全部</button>
                 </div>
             </div>
@@ -205,8 +173,8 @@ cat > app/public/index.html << 'EOF'
                         <tr>
                             <th style="width:30px"><input type="checkbox" class="tbl-chk" onclick="toggleAll(this)"></th>
                             <th style="width:40px">ID</th>
-                            <th style="width:40%">标题</th>
-                            <th style="width:35%">磁力链</th>
+                            <th style="width:150px">标题</th>
+                            <th style="width:150px">磁力链</th>
                             <th style="width:120px">入库时间</th>
                         </tr>
                     </thead>
@@ -225,7 +193,7 @@ cat > app/public/index.html << 'EOF'
             <div class="card" style="border-left: 4px solid #e14eca">
                 <div style="display:flex; justify-content:space-between; align-items:center">
                     <h3>🔄 系统升级</h3>
-                    <span id="cur-ver" style="color:#e14eca; font-weight:bold">V13.2.0</span>
+                    <span id="cur-ver" style="color:#e14eca; font-weight:bold">V13.2.1</span>
                 </div>
                 <p style="color:#aaa; font-size:12px; margin-bottom:10px">
                     升级源: GitHub (ghostlpz/mdqupdate) <br>
@@ -264,4 +232,4 @@ docker-compose exec -T app npm install --no-audit --no-fund
 echo "🔄 正在重启应用..."
 docker-compose restart app
 
-echo "✅ 升级完成！请刷新浏览器查看 V13.2.0"
+echo "✅ 升级完成！请刷新浏览器查看 V13.2.1"
