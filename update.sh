@@ -1,7 +1,7 @@
 #!/bin/sh
-# VERSION=13.5.1
+# VERSION=13.5.2
 
-echo "🚀 [容器内] 开始执行 V13.5.1 UI 修复..."
+echo "🚀 [容器内] 开始执行 V13.5.2 UI 细节修复..."
 
 cd /app
 
@@ -9,7 +9,7 @@ cd /app
 cat > package.json << 'EOF'
 {
   "name": "madou-omni-system",
-  "version": "13.5.1",
+  "version": "13.5.2",
   "main": "app.js",
   "dependencies": {
     "axios": "^1.6.0",
@@ -25,7 +25,7 @@ cat > package.json << 'EOF'
 }
 EOF
 
-# 2. 修复 index.html (CSS 调整)
+# 2. 修复 index.html (移除 HTML 标签里的 style="width:100%")
 cat > public/index.html << 'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -97,23 +97,20 @@ cat > public/index.html << 'EOF'
             box-shadow: var(--shadow);
         }
 
-        /* === 🔥 按钮样式修复：默认 auto 宽度，不占满 === */
+        /* 按钮基础样式 (PC端默认 auto 宽度) */
         .btn {
-            padding: 10px 20px;
+            padding: 10px 24px;
             border: none; border-radius: 8px; font-weight: 500; cursor: pointer;
             transition: all 0.2s; display: inline-flex; align-items: center; justify-content: center;
             gap: 8px; color: white; font-size: 14px;
-            width: auto; /* PC端默认不拉伸 */
+            width: auto; /* 关键：PC端自适应 */
             min-width: 100px;
         }
         .btn:active { transform: scale(0.98); }
         .btn-pri { background: var(--primary); }
         .btn-pri:hover { background: var(--primary-hover); }
-        
-        /* 修复 Success 按钮颜色 */
         .btn-succ { background: var(--success); color: #fff; } 
         .btn-succ:hover { filter: brightness(1.1); }
-        
         .btn-dang { background: var(--danger); }
         .btn-warn { background: var(--warning); color: #000; }
         .btn-info { background: #3b82f6; }
@@ -126,7 +123,7 @@ cat > public/index.html << 'EOF'
         }
         input:focus, select:focus, textarea:focus { border-color: var(--primary); }
 
-        /* PC端按钮组：左对齐，紧凑 */
+        /* PC端按钮组：左对齐 */
         .btn-row { display: flex; gap: 10px; justify-content: flex-start; margin-bottom: 10px; flex-wrap: wrap; }
 
         .log-box {
@@ -152,7 +149,7 @@ cat > public/index.html << 'EOF'
         .lock-box { background: var(--bg-sidebar); padding: 40px; border-radius: 16px; width: 100%; max-width: 360px; text-align: center; border: 1px solid var(--border); }
         .hidden { display: none !important; }
 
-        /* === 📱 移动端适配 (App 风格) === */
+        /* === 📱 移动端适配 === */
         @media (max-width: 768px) {
             body { flex-direction: column; height: 100dvh; }
             .sidebar {
@@ -167,9 +164,9 @@ cat > public/index.html << 'EOF'
             .nav-icon { margin: 0; font-size: 20px; }
             .main { padding: 15px; padding-bottom: 80px; }
             
-            /* 手机端按钮：强制全宽 */
+            /* 手机端按钮强制撑满 */
             .btn { width: 100%; margin-right: 0; margin-bottom: 10px; }
-            .btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; } /* 手机上两列布局 */
+            .btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
             
             .filter-bar { flex-direction: column; gap: 10px; }
         }
@@ -233,7 +230,7 @@ cat > public/index.html << 'EOF'
                 </div>
                 
                 <div class="btn-row">
-                    <button class="btn btn-pri" style="flex:1" onclick="startRenamer()">🚀 开始整理</button>
+                    <button class="btn btn-pri" onclick="startRenamer()">🚀 开始整理</button>
                     <button class="btn btn-dang" onclick="api('stop')">⏹ 停止</button>
                 </div>
 
@@ -274,8 +271,8 @@ cat > public/index.html << 'EOF'
             <div class="card" style="padding:0;overflow:hidden">
                 <div style="padding:15px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:rgba(0,0,0,0.1)">
                     <div class="btn-row" style="margin-bottom:0">
-                        <button class="btn btn-info" style="padding:6px 12px;font-size:12px;min-width:auto" onclick="pushSelected()">📤 推送选中</button>
-                        <button class="btn btn-warn" style="padding:6px 12px;font-size:12px;min-width:auto" onclick="window.open(url('/export?type=all'))">📥 导出CSV</button>
+                        <button class="btn btn-info" style="padding:6px 12px;font-size:12px" onclick="pushSelected()">📤 推送选中</button>
+                        <button class="btn btn-warn" style="padding:6px 12px;font-size:12px" onclick="window.open(url('/export?type=all'))">📥 导出CSV</button>
                     </div>
                     <div id="total-count" style="font-size:12px;color:var(--text-sub)">Loading...</div>
                 </div>
@@ -317,7 +314,7 @@ cat > public/index.html << 'EOF'
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-top:15px">
                     <div>
                         <div style="font-size:13px;color:var(--text-sub)">当前版本</div>
-                        <div id="cur-ver" style="font-size:24px;font-weight:bold;color:var(--text-main)">V13.5.1</div>
+                        <div id="cur-ver" style="font-size:24px;font-weight:bold;color:var(--text-main)">V13.5.2</div>
                     </div>
                     <button class="btn btn-succ" onclick="runOnlineUpdate()">检查更新</button>
                 </div>
@@ -333,7 +330,9 @@ cat > public/index.html << 'EOF'
                     <label>115 Cookie (手动填入)</label>
                     <textarea id="cfg-cookie" rows="4" placeholder="UID=...; CID=...; SEID=..."></textarea>
                 </div>
-                <button class="btn btn-pri" style="width:100%" onclick="saveCfg()">💾 保存配置</button>
+                <div class="btn-row">
+                    <button class="btn btn-pri" onclick="saveCfg()">💾 保存配置</button>
+                </div>
             </div>
         </div>
     </div>
@@ -349,7 +348,6 @@ cat > public/index.html << 'EOF'
 
     <script src="js/app.js"></script>
     <script>
-        // JS 逻辑
         async function loadDb(p) {
             if(p < 1) return;
             dbPage = p;
@@ -395,4 +393,4 @@ npm install --registry=https://registry.npmmirror.com
 echo "🔄 重启应用..."
 kill 1
 
-echo "✅ V13.5.1 UI 修复完成！"
+echo "✅ V13.5.2 UI 完美修复版已就绪！"
