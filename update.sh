@@ -1,7 +1,7 @@
 #!/bin/sh
-# VERSION=13.5.2
+# VERSION=13.6.0
 
-echo "🚀 [容器内] 开始执行 V13.5.2 UI 细节修复..."
+echo "🚀 [容器内] 执行 V13.6.0 资源库布局优化..."
 
 cd /app
 
@@ -9,7 +9,7 @@ cd /app
 cat > package.json << 'EOF'
 {
   "name": "madou-omni-system",
-  "version": "13.5.2",
+  "version": "13.6.0",
   "main": "app.js",
   "dependencies": {
     "axios": "^1.6.0",
@@ -25,7 +25,7 @@ cat > package.json << 'EOF'
 }
 EOF
 
-# 2. 修复 index.html (移除 HTML 标签里的 style="width:100%")
+# 2. 更新 UI (核心：调整表格列宽 CSS + JS取消截断)
 cat > public/index.html << 'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -67,22 +67,15 @@ cat > public/index.html << 'EOF'
         }
 
         .sidebar {
-            width: 260px;
-            background: var(--bg-sidebar);
-            border-right: 1px solid var(--border);
-            display: flex;
-            flex-direction: column;
-            padding: 20px;
-            z-index: 10;
+            width: 260px; background: var(--bg-sidebar); border-right: 1px solid var(--border);
+            display: flex; flex-direction: column; padding: 20px; z-index: 10;
         }
-
         .logo { font-size: 24px; font-weight: 700; color: var(--text-main); margin-bottom: 40px; }
         .logo span { color: var(--primary); }
-
         .nav-item {
-            display: flex; align-items: center; padding: 12px 16px;
-            color: var(--text-sub); text-decoration: none; border-radius: var(--radius);
-            margin-bottom: 8px; transition: all 0.2s; font-weight: 500; cursor: pointer;
+            display: flex; align-items: center; padding: 12px 16px; color: var(--text-sub);
+            text-decoration: none; border-radius: var(--radius); margin-bottom: 8px;
+            transition: all 0.2s; font-weight: 500; cursor: pointer;
         }
         .nav-item:hover { background: rgba(255,255,255,0.05); color: var(--text-main); }
         .nav-item.active { background: var(--primary); color: white; box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3); }
@@ -97,14 +90,10 @@ cat > public/index.html << 'EOF'
             box-shadow: var(--shadow);
         }
 
-        /* 按钮基础样式 (PC端默认 auto 宽度) */
         .btn {
-            padding: 10px 24px;
-            border: none; border-radius: 8px; font-weight: 500; cursor: pointer;
+            padding: 10px 24px; border: none; border-radius: 8px; font-weight: 500; cursor: pointer;
             transition: all 0.2s; display: inline-flex; align-items: center; justify-content: center;
-            gap: 8px; color: white; font-size: 14px;
-            width: auto; /* 关键：PC端自适应 */
-            min-width: 100px;
+            gap: 8px; color: white; font-size: 14px; min-width: 100px;
         }
         .btn:active { transform: scale(0.98); }
         .btn-pri { background: var(--primary); }
@@ -122,8 +111,6 @@ cat > public/index.html << 'EOF'
             border-radius: 8px; padding: 10px 12px; color: white; font-family: inherit; transition: 0.2s;
         }
         input:focus, select:focus, textarea:focus { border-color: var(--primary); }
-
-        /* PC端按钮组：左对齐 */
         .btn-row { display: flex; gap: 10px; justify-content: flex-start; margin-bottom: 10px; flex-wrap: wrap; }
 
         .log-box {
@@ -132,43 +119,63 @@ cat > public/index.html << 'EOF'
         }
         .log-box .err{color:#f55} .log-box .warn{color:#fb5} .log-box .suc{color:#5f7}
 
-        .table-container { overflow-x: auto; }
-        table { width: 100%; border-collapse: collapse; white-space: nowrap; }
-        th { text-align: left; color: var(--text-sub); padding: 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
-        td { padding: 12px; border-bottom: 1px solid var(--border); color: var(--text-main); font-size: 14px; }
-        
-        .tag { padding: 4px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; }
-        .tag-push { background: rgba(16, 185, 129, 0.2); color: #34d399; }
-        .tag-ren { background: rgba(59, 130, 246, 0.2); color: #60a5fa; }
-
         .filter-bar { display: flex; gap: 15px; background: rgba(0,0,0,0.2); padding: 15px; border-radius: 8px; align-items: flex-end; margin-bottom: 20px; }
         .filter-item { flex: 1; }
         .filter-item select { margin-bottom: 0; }
+
+        /* === 🔥🔥 表格布局优化核心 🔥🔥 */
+        .table-container { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; table-layout: fixed; /* 固定布局 */ }
+        
+        th, td { 
+            text-align: left; padding: 12px; border-bottom: 1px solid var(--border); 
+            font-size: 13px; vertical-align: top; /* 顶部对齐，防止高度不一时难看 */
+        }
+        th { color: var(--text-sub); background: rgba(0,0,0,0.2); }
+        td { color: var(--text-main); line-height: 1.5; }
+
+        /* === 列宽定义 === */
+        .col-chk { width: 40px; }
+        .col-id { width: 60px; }
+        .col-time { width: 110px; }
+        .col-title { width: 25%; } /* 标题占 25% */
+        /* 磁力链不设宽，自动占满剩余空间 (约50%+) */
+        
+        /* 磁力链内容样式：允许换行，等宽字体 */
+        .magnet-cell { 
+            word-break: break-all; /* 强制换行 */
+            white-space: normal;   /* 允许折行 */
+            font-family: monospace; 
+            font-size: 12px;
+            color: #a5b4fc; /* 淡紫色 */
+        }
+        .title-cell {
+            white-space: normal; /* 标题也允许折行 */
+            font-weight: 500;
+        }
+
+        .tag { padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; margin-right: 5px; display: inline-block; margin-bottom: 4px;}
+        .tag-push { background: rgba(16, 185, 129, 0.2); color: #34d399; }
+        .tag-ren { background: rgba(59, 130, 246, 0.2); color: #60a5fa; }
 
         #lock { position: fixed; inset: 0; background: rgba(15, 23, 42, 0.95); z-index: 999; display: flex; align-items: center; justify-content: center; }
         .lock-box { background: var(--bg-sidebar); padding: 40px; border-radius: 16px; width: 100%; max-width: 360px; text-align: center; border: 1px solid var(--border); }
         .hidden { display: none !important; }
 
-        /* === 📱 移动端适配 === */
         @media (max-width: 768px) {
             body { flex-direction: column; height: 100dvh; }
-            .sidebar {
-                position: fixed; bottom: 0; left: 0; width: 100%; height: 60px;
-                flex-direction: row; padding: 0; background: rgba(30, 41, 59, 0.9);
-                backdrop-filter: blur(10px); border-top: 1px solid var(--border); border-right: none;
-                justify-content: space-around; align-items: center;
-            }
+            .sidebar { position: fixed; bottom: 0; left: 0; width: 100%; height: 60px; flex-direction: row; padding: 0; background: rgba(30, 41, 59, 0.9); backdrop-filter: blur(10px); border-top: 1px solid var(--border); border-right: none; justify-content: space-around; align-items: center; }
             .logo { display: none; }
             .nav-item { flex-direction: column; gap: 4px; padding: 6px; margin: 0; font-size: 10px; background: none !important; color: var(--text-sub); }
             .nav-item.active { color: var(--primary); background: none; box-shadow: none; }
             .nav-icon { margin: 0; font-size: 20px; }
             .main { padding: 15px; padding-bottom: 80px; }
-            
-            /* 手机端按钮强制撑满 */
             .btn { width: 100%; margin-right: 0; margin-bottom: 10px; }
             .btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-            
             .filter-bar { flex-direction: column; gap: 10px; }
+            
+            /* 手机端保持横向滚动，防止表格太窄 */
+            table { min-width: 700px; } 
         }
     </style>
 </head>
@@ -198,19 +205,16 @@ cat > public/index.html << 'EOF'
                     <h1>资源采集</h1>
                     <div style="font-size:14px;color:var(--text-sub)">今日采集: <span id="stat-scr" style="color:var(--primary);font-weight:bold;font-size:18px">0</span></div>
                 </div>
-                
                 <div class="input-group" style="display:flex;align-items:center;gap:10px;background:rgba(255,255,255,0.05);padding:10px;border-radius:8px;margin-bottom:20px">
                     <input type="checkbox" id="auto-dl" style="width:20px;height:20px;margin:0">
                     <label for="auto-dl" style="margin:0;cursor:pointer">启用自动推送 (采集成功后直接发往 115)</label>
                 </div>
-
                 <div class="btn-row">
                     <button class="btn btn-succ" onclick="api('start',{type:'inc', autoDownload: getDlState()})">▶ 增量采集</button>
                     <button class="btn btn-info" onclick="api('start',{type:'full', autoDownload: getDlState()})">♻️ 全量采集</button>
                     <button class="btn btn-dang" onclick="api('stop')">⏹ 停止</button>
                 </div>
             </div>
-
             <div class="card" style="padding:0;overflow:hidden">
                 <div style="padding:15px;border-bottom:1px solid var(--border);font-weight:600">📡 实时终端日志</div>
                 <div id="log-scr" class="log-box" style="border:none;border-radius:0"></div>
@@ -228,12 +232,10 @@ cat > public/index.html << 'EOF'
                     <input type="checkbox" id="r-force" style="width:20px;margin:0">
                     <label for="r-force" style="margin:0">强制模式 (重新检查已整理项目)</label>
                 </div>
-                
                 <div class="btn-row">
                     <button class="btn btn-pri" onclick="startRenamer()">🚀 开始整理</button>
                     <button class="btn btn-dang" onclick="api('stop')">⏹ 停止</button>
                 </div>
-
                 <div style="margin-top:20px;display:flex;justify-content:space-around;text-align:center;background:rgba(0,0,0,0.2);padding:15px;border-radius:8px">
                     <div><div style="font-size:12px;color:var(--text-sub)">成功</div><div id="stat-suc" style="color:var(--success);font-size:20px;font-weight:bold">0</div></div>
                     <div><div style="font-size:12px;color:var(--text-sub)">失败</div><div id="stat-fail" style="color:var(--danger);font-size:20px;font-weight:bold">0</div></div>
@@ -248,31 +250,21 @@ cat > public/index.html << 'EOF'
 
         <div id="database" class="page hidden">
             <h1>资源数据库</h1>
-            
             <div class="filter-bar">
                 <div class="filter-item">
                     <label>推送状态</label>
-                    <select id="filter-push" onchange="loadDb(1)">
-                        <option value="">全部</option>
-                        <option value="1">✅ 已推送</option>
-                        <option value="0">⏳ 未推送</option>
-                    </select>
+                    <select id="filter-push" onchange="loadDb(1)"><option value="">全部</option><option value="1">✅ 已推送</option><option value="0">⏳ 未推送</option></select>
                 </div>
                 <div class="filter-item">
                     <label>整理状态</label>
-                    <select id="filter-ren" onchange="loadDb(1)">
-                        <option value="">全部</option>
-                        <option value="1">✨ 已整理</option>
-                        <option value="0">📝 未整理</option>
-                    </select>
+                    <select id="filter-ren" onchange="loadDb(1)"><option value="">全部</option><option value="1">✨ 已整理</option><option value="0">📝 未整理</option></select>
                 </div>
             </div>
-
             <div class="card" style="padding:0;overflow:hidden">
                 <div style="padding:15px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:rgba(0,0,0,0.1)">
                     <div class="btn-row" style="margin-bottom:0">
-                        <button class="btn btn-info" style="padding:6px 12px;font-size:12px" onclick="pushSelected()">📤 推送选中</button>
-                        <button class="btn btn-warn" style="padding:6px 12px;font-size:12px" onclick="window.open(url('/export?type=all'))">📥 导出CSV</button>
+                        <button class="btn btn-info" style="padding:6px 12px;font-size:12px;min-width:auto" onclick="pushSelected()">📤 推送选中</button>
+                        <button class="btn btn-warn" style="padding:6px 12px;font-size:12px;min-width:auto" onclick="window.open(url('/export?type=all'))">📥 导出CSV</button>
                     </div>
                     <div id="total-count" style="font-size:12px;color:var(--text-sub)">Loading...</div>
                 </div>
@@ -281,11 +273,10 @@ cat > public/index.html << 'EOF'
                     <table id="db-tbl">
                         <thead>
                             <tr>
-                                <th style="width:40px"><input type="checkbox" onclick="toggleAll(this)"></th>
-                                <th style="width:60px">ID</th>
-                                <th>标题</th>
-                                <th>磁力链</th>
-                                <th style="width:140px">时间</th>
+                                <th class="col-chk"><input type="checkbox" onclick="toggleAll(this)"></th>
+                                <th class="col-id">ID</th>
+                                <th class="col-title">标题</th>
+                                <th>磁力链</th> <th class="col-time">时间</th>
                             </tr>
                         </thead>
                         <tbody></tbody>
@@ -302,32 +293,26 @@ cat > public/index.html << 'EOF'
 
         <div id="settings" class="page hidden">
             <h1>系统设置</h1>
-            
             <div class="card" style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px">
                 <div style="font-size:48px;margin-bottom:20px">📱</div>
                 <button class="btn btn-pri" style="font-size:16px;padding:12px 30px" onclick="showQr()">扫码登录 115</button>
                 <p style="color:var(--text-sub);margin-top:10px;font-size:13px">使用 115 App 扫码，Cookie 将自动更新</p>
             </div>
-
             <div class="card" style="border-left: 4px solid var(--success)">
                 <h3>☁️ 在线升级</h3>
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-top:15px">
-                    <div>
-                        <div style="font-size:13px;color:var(--text-sub)">当前版本</div>
-                        <div id="cur-ver" style="font-size:24px;font-weight:bold;color:var(--text-main)">V13.5.2</div>
-                    </div>
+                    <div><div style="font-size:13px;color:var(--text-sub)">当前版本</div><div id="cur-ver" style="font-size:24px;font-weight:bold;color:var(--text-main)">V13.6.0</div></div>
                     <button class="btn btn-succ" onclick="runOnlineUpdate()">检查更新</button>
                 </div>
             </div>
-
             <div class="card">
                 <h3>网络配置</h3>
                 <div class="input-group">
-                    <label>HTTP 代理 (例如: http://192.168.1.5:7890)</label>
+                    <label>HTTP 代理</label>
                     <input id="cfg-proxy" placeholder="留空则直连">
                 </div>
                 <div class="input-group">
-                    <label>115 Cookie (手动填入)</label>
+                    <label>115 Cookie</label>
                     <textarea id="cfg-cookie" rows="4" placeholder="UID=...; CID=...; SEID=..."></textarea>
                 </div>
                 <div class="btn-row">
@@ -367,16 +352,17 @@ cat > public/index.html << 'EOF'
                     if (r.is_pushed) tags += `<span class="tag tag-push">已推</span> `;
                     if (r.is_renamed) tags += `<span class="tag tag-ren">已整</span>`;
                     const chkValue = `${r.id}|${r.magnets}`;
-                    const magnetShort = r.magnets ? r.magnets.substring(0, 15) + '...' : '无';
+                    // 🔥 修改：显示完整磁力链，不再截断
+                    const magnetText = r.magnets || ''; 
                     tbody.innerHTML += `
                         <tr>
                             <td><input type="checkbox" class="tbl-chk row-chk" value="${chkValue}"></td>
                             <td><span style="opacity:0.5">#</span>${r.id}</td>
-                            <td>
-                                <div style="font-weight:500;margin-bottom:4px">${r.title}</div>
+                            <td class="title-cell">
+                                <div style="margin-bottom:4px">${r.title}</div>
                                 <div>${tags}</div>
                             </td>
-                            <td style="font-family:monospace;font-size:12px;color:var(--text-sub)">${magnetShort}</td>
+                            <td class="magnet-cell">${magnetText}</td>
                             <td style="font-size:12px;color:var(--text-sub)">${time}</td>
                         </tr>`;
                 });
@@ -393,4 +379,4 @@ npm install --registry=https://registry.npmmirror.com
 echo "🔄 重启应用..."
 kill 1
 
-echo "✅ V13.5.2 UI 完美修复版已就绪！"
+echo "✅ V13.6.0 布局优化完成！请强制刷新浏览器。"
