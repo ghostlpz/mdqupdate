@@ -1,9 +1,9 @@
 #!/bin/bash
-# VERSION = 13.9.3
+# VERSION = 13.9.4
 
-echo "🚀 正在部署 V13.9.3 隐身模式 (修复 Cloudflare 验证超时)..."
+echo "🚀 正在部署 V13.9.4 修复版 (增加鼠标模拟 & 延长验证等待时间)..."
 
-# 1. 更新 scraper.js - 增加隐身特性和智能等待
+# 1. 更新 scraper.js - 修复等待逻辑
 echo "📝 更新 /app/modules/scraper.js..."
 cat > /app/modules/scraper.js << 'EOF'
 const axios = require('axios');
@@ -88,8 +88,9 @@ async function scrapeMadouQu(limitPages, autoDownload) {
     }
 }
 
+// XChina 增强版逻辑
 async function scrapeXChina(limitPages, autoDownload) {
-    log(`==== 启动 XChina (隐身模式 V13.9.3) ====`, 'info');
+    log(`==== 启动 XChina (隐身+鼠标模拟 V13.9.4) ====`, 'info');
     const execPath = findChromium();
     if (!execPath) { log(`❌ 未找到 Chromium`, 'error'); return; }
 
@@ -100,7 +101,8 @@ async function scrapeXChina(limitPages, autoDownload) {
             '--disable-setuid-sandbox', 
             '--disable-dev-shm-usage', 
             '--disable-gpu',
-            '--disable-blink-features=AutomationControlled' // 关键：禁用自动化控制特征
+            '--disable-blink-features=AutomationControlled',
+            '--window-size=1920,1080' // 设置大窗口，看起来像电脑
         ];
         if (global.CONFIG.proxy) {
             const proxyUrl = global.CONFIG.proxy.replace('http://', '').replace('https://', '');
@@ -110,12 +112,16 @@ async function scrapeXChina(limitPages, autoDownload) {
         browser = await puppeteer.launch({ executablePath: execPath, headless: 'new', args: launchArgs });
         const page = await browser.newPage();
         
-        // 关键：注入脚本，彻底抹除 webdriver 特征
+        // 伪装脚本
         await page.evaluateOnNewDocument(() => {
             Object.defineProperty(navigator, 'webdriver', { get: () => false });
+            // 增加更多伪装
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh'] });
         });
 
-        // 资源拦截优化
+        // 拦截资源
         await page.setRequestInterception(true);
         page.on('request', (req) => {
             if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) req.abort();
@@ -129,33 +135,55 @@ async function scrapeXChina(limitPages, autoDownload) {
         const domain = "https://xchina.co";
 
         while (currPage <= limitPages && !STATE.stopSignal) {
-            log(`[XChina] 浏览器正在渲染第 ${currPage} 页...`);
+            log(`[XChina] 浏览器正在加载第 ${currPage} 页...`);
             
-            // 访问列表页
             try {
+                // 加载页面
                 await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-            } catch(e) {
-                log(`❌ 页面加载异常，重试下一页`, 'warn');
-                break;
-            }
-
-            // 智能等待：等待视频列表元素出现，最多等待 30 秒
-            // 只要视频列表出来了，说明 Cloudflare 盾已经过了
-            try {
-                // log(`⏳ 正在等待 Cloudflare 验证通过...`);
-                await page.waitForSelector('.list.video-index .item.video', { timeout: 30000 });
-            } catch(e) {
-                // 如果超时还没找到视频列表，说明还在盾牌页或者 IP 被封了
-                const content = await page.content();
-                if (content.includes('challenge-platform') || content.includes('Just a moment')) {
-                    log(`❌ Cloudflare 验证失败 (IP 可能被风控，请检查代理)`, 'error');
-                } else {
-                    log(`❌ 页面结构解析失败 (超时)`, 'error');
+                
+                // === 智能验证核心修复 ===
+                // 检查是否遇到盾牌
+                const title = await page.title();
+                if (title.includes('Just a moment') || title.includes('Attention Required')) {
+                    log(`🛡️ 遇到 Cloudflare，开始模拟真人验证 (最多等30秒)...`, 'warn');
+                    
+                    // 模拟鼠标乱动 (模拟人类焦急等待)
+                    for(let k=0; k<10; k++) {
+                        if (STATE.stopSignal) break;
+                        try {
+                            await page.mouse.move(Math.random()*500, Math.random()*500);
+                            await page.mouse.down();
+                            await page.mouse.up();
+                        } catch(e){}
+                        await new Promise(r => setTimeout(r, 1000));
+                        
+                        // 每次动完检查一下是不是通过了
+                        const currentTitle = await page.title();
+                        if (!currentTitle.includes('Just a moment') && !currentTitle.includes('Attention')) {
+                            log(`✨ 验证通过！进入页面...`, 'success');
+                            break;
+                        }
+                    }
                 }
+
+                // 强制等待关键元素出现 (这是最稳的，不再依赖固定时间)
+                try {
+                    await page.waitForSelector('.list.video-index .item.video', { timeout: 30000 });
+                } catch(e) {
+                    // 如果等了30秒还没出来，说明真的卡住了
+                    log(`❌ 验证超时或页面结构变更 (未找到视频列表)`, 'error');
+                    // 截图保存以供调试 (可选，这里先只打日志)
+                    // const html = await page.content();
+                    // log(`Debug: ${html.substring(0, 100)}`);
+                    break;
+                }
+
+            } catch(e) {
+                log(`❌ 页面加载异常: ${e.message}`, 'warn');
                 break;
             }
 
-            // 提取数据
+            // 获取数据
             const items = await page.evaluate((domain) => {
                 const els = document.querySelectorAll('.list.video-index .item.video');
                 const results = [];
@@ -170,21 +198,16 @@ async function scrapeXChina(limitPages, autoDownload) {
                 return results;
             }, domain);
 
-            if (items.length === 0) { log(`⚠️ 未找到视频`, 'warn'); break; }
-            log(`[XChina] 验证通过！本页发现 ${items.length} 个资源...`);
+            if (items.length === 0) { log(`⚠️ 本页无数据`, 'warn'); break; }
+            log(`[XChina] 发现 ${items.length} 个资源，开始采集...`);
 
             for (const item of items) {
                 if (STATE.stopSignal) break;
                 try {
                     await page.goto(item.link, { waitUntil: 'domcontentloaded', timeout: 30000 });
                     
-                    // 同样使用智能等待，确保详情页加载完成
-                    try {
-                        await page.waitForSelector('a[href*="/download/id-"]', { timeout: 15000 });
-                    } catch(e) { 
-                        // 可能是非下载类视频或加载慢，跳过
-                        continue; 
-                    }
+                    // 详情页也可能遇到验证，稍微等一下
+                    try { await page.waitForSelector('a[href*="/download/id-"]', { timeout: 10000 }); } catch(e){}
 
                     const dlLink = await page.evaluate((domain) => {
                         const a = document.querySelector('a[href*="/download/id-"]');
@@ -197,7 +220,7 @@ async function scrapeXChina(limitPages, autoDownload) {
                     if (dlLink) {
                         await page.goto(dlLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
                         try {
-                            await page.waitForSelector('a.btn.magnet[href^="magnet:"]', { timeout: 15000 });
+                            await page.waitForSelector('a.btn.magnet[href^="magnet:"]', { timeout: 10000 });
                             const magnet = await page.$eval('a.btn.magnet[href^="magnet:"]', el => el.getAttribute('href'));
                             if (magnet) {
                                 const saved = await ResourceMgr.save(item.title, item.link, magnet);
@@ -213,8 +236,8 @@ async function scrapeXChina(limitPages, autoDownload) {
                             }
                         } catch(e) {}
                     }
-                } catch (e) { log(`❌ 解析失败: ${e.message}`, 'error'); }
-                await new Promise(r => setTimeout(r, 1500));
+                } catch (e) { log(`❌ 单条失败: ${e.message}`, 'error'); }
+                await new Promise(r => setTimeout(r, 1000));
             }
 
             // 翻页
@@ -270,6 +293,6 @@ EOF
 
 # 2. 更新版本号
 echo "📝 更新 /app/package.json..."
-sed -i 's/"version": ".*"/"version": "13.9.3"/' /app/package.json
+sed -i 's/"version": ".*"/"version": "13.9.4"/' /app/package.json
 
-echo "✅ 升级完成 (V13.9.3)，系统将重启..."
+echo "✅ 升级完成 (V13.9.4)，系统将重启..."
