@@ -1,11 +1,13 @@
 #!/bin/bash
-# VERSION = 13.7.0
+# VERSION = 13.7.1
 
-echo "🚀 开始升级 Madou-Omni 到 v13.7.0 (支持多源采集)..."
+echo "🚀 开始升级 Madou-Omni 到 v13.7.1 (路径修复版)..."
+
+# 注意：Docker 容器内的标准路径是 /app，不是 /app/app
 
 # 1. 更新前端界面 (index.html) - 增加数据源选择器
-echo "📝 更新 app/public/index.html..."
-cat > /app/app/public/index.html << 'EOF'
+echo "📝 更新 /app/public/index.html..."
+cat > /app/public/index.html << 'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -259,8 +261,8 @@ cat > /app/app/public/index.html << 'EOF'
 EOF
 
 # 2. 更新前端逻辑 (app.js) - 发送 source 参数
-echo "📝 更新 app/public/js/app.js..."
-cat > /app/app/public/js/app.js << 'EOF'
+echo "📝 更新 /app/public/js/app.js..."
+cat > /app/public/js/app.js << 'EOF'
 let dbPage = 1;
 let qrTimer = null;
 
@@ -399,8 +401,8 @@ async function showQr() {
 EOF
 
 # 3. 更新后端 API (api.js) - 接收 source 参数
-echo "📝 更新 app/routes/api.js..."
-cat > /app/app/routes/api.js << 'EOF'
+echo "📝 更新 /app/routes/api.js..."
+cat > /app/routes/api.js << 'EOF'
 const express = require('express');
 const axios = require('axios');
 const router = express.Router();
@@ -577,8 +579,8 @@ module.exports = router;
 EOF
 
 # 4. 更新爬虫模块 (scraper.js) - 支持多源选择
-echo "📝 更新 app/modules/scraper.js..."
-cat > /app/app/modules/scraper.js << 'EOF'
+echo "📝 更新 /app/modules/scraper.js..."
+cat > /app/modules/scraper.js << 'EOF'
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { HttpsProxyAgent } = require('https-proxy-agent');
@@ -754,7 +756,7 @@ module.exports = Scraper;
 EOF
 
 # 5. 更新版本号 (package.json)
-echo "📝 更新 app/package.json..."
-sed -i 's/"version": ".*"/"version": "13.7.0"/' /app/app/package.json
+echo "📝 更新 /app/package.json..."
+sed -i 's/"version": ".*"/"version": "13.7.1"/' /app/package.json
 
 echo "✅ 升级完成，系统将自动重启..."
