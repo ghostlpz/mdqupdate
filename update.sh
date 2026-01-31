@@ -1,11 +1,9 @@
 #!/bin/bash
-# VERSION = 13.7.1
+# VERSION = 13.7.2
 
-echo "🚀 开始升级 Madou-Omni 到 v13.7.1 (路径修复版)..."
+echo "🚀 开始升级 Madou-Omni 到 v13.7.2 (增加 Cookie 穿透支持)..."
 
-# 注意：Docker 容器内的标准路径是 /app，不是 /app/app
-
-# 1. 更新前端界面 (index.html) - 增加数据源选择器
+# 1. 更新前端界面 (index.html) - 增加 采集Cookie 输入框
 echo "📝 更新 /app/public/index.html..."
 cat > /app/public/index.html << 'EOF'
 <!DOCTYPE html>
@@ -108,7 +106,7 @@ cat > /app/public/index.html << 'EOF'
                     <label>📡 选择采集源</label>
                     <select id="src-site">
                         <option value="madou">MadouQu (麻豆区)</option>
-                        <option value="xchina">XChina (小黄书)</option>
+                        <option value="xchina">XChina (小黄书) - 需配置Cookie</option>
                     </select>
                 </div>
                 <div class="input-group" style="display:flex;align-items:center;gap:10px;background:rgba(255,255,255,0.05);padding:10px;border-radius:8px;margin-bottom:20px">
@@ -210,8 +208,12 @@ cat > /app/public/index.html << 'EOF'
             <div class="card">
                 <h3>网络配置</h3>
                 <div class="input-group">
-                    <label>HTTP 代理</label>
+                    <label>HTTP 代理 (例如 http://192.168.1.5:7890)</label>
                     <input id="cfg-proxy" placeholder="留空则直连">
+                </div>
+                <div class="input-group">
+                    <label>采集 Cookie (解决 403 Forbidden 问题)</label>
+                    <textarea id="cfg-scraper-cookie" rows="3" placeholder="在浏览器登录 xchina/madouqu，F12 -> 网络 -> 复制请求头中的 Cookie 粘贴至此"></textarea>
                 </div>
                 <div class="input-group">
                     <label>115 Cookie</label>
@@ -260,7 +262,7 @@ cat > /app/public/index.html << 'EOF'
 </html>
 EOF
 
-# 2. 更新前端逻辑 (app.js) - 发送 source 参数
+# 2. 更新前端逻辑 (app.js) - 支持保存和读取新 Cookie
 echo "📝 更新 /app/public/js/app.js..."
 cat > /app/public/js/app.js << 'EOF'
 let dbPage = 1;
@@ -309,6 +311,8 @@ function show(id) {
             if(r.config) {
                 document.getElementById('cfg-proxy').value = r.config.proxy || '';
                 document.getElementById('cfg-cookie').value = r.config.cookie115 || '';
+                // 新增：读取采集 Cookie
+                document.getElementById('cfg-scraper-cookie').value = r.config.scraperCookie || '';
             }
             if(r.version) {
                 document.getElementById('cur-ver').innerText = "V" + r.version;
@@ -320,7 +324,6 @@ function show(id) {
 function getDlState() { return document.getElementById('auto-dl').checked; }
 async function api(act, body={}) { await request(act, { method: 'POST', body: JSON.stringify(body) }); }
 
-// 新增：开始采集的包装函数，获取选中的源
 async function startScrape(type) {
     const source = document.getElementById('src-site').value;
     const autoDl = getDlState();
@@ -348,7 +351,15 @@ async function runOnlineUpdate() {
 }
 
 async function saveCfg() {
-    await request('config', { method: 'POST', body: JSON.stringify({ proxy: document.getElementById('cfg-proxy').value, cookie115: document.getElementById('cfg-cookie').value }) });
+    // 新增：保存采集 Cookie
+    await request('config', { 
+        method: 'POST', 
+        body: JSON.stringify({ 
+            proxy: document.getElementById('cfg-proxy').value, 
+            cookie115: document.getElementById('cfg-cookie').value,
+            scraperCookie: document.getElementById('cfg-scraper-cookie').value 
+        }) 
+    });
     alert('保存成功');
 }
 
@@ -400,185 +411,7 @@ async function showQr() {
 }
 EOF
 
-# 3. 更新后端 API (api.js) - 接收 source 参数
-echo "📝 更新 /app/routes/api.js..."
-cat > /app/routes/api.js << 'EOF'
-const express = require('express');
-const axios = require('axios');
-const router = express.Router();
-const fs = require('fs');
-const { exec } = require('child_process');
-const { HttpsProxyAgent } = require('https-proxy-agent');
-const { Parser } = require('json2csv');
-const Scraper = require('../modules/scraper');
-const Renamer = require('../modules/renamer');
-const Login115 = require('../modules/login_115');
-const ResourceMgr = require('../modules/resource_mgr');
-const AUTH_PASSWORD = process.env.AUTH_PASSWORD || "admin888";
-
-router.get('/check-auth', (req, res) => {
-    const auth = req.headers['authorization'];
-    res.json({ authenticated: auth === AUTH_PASSWORD });
-});
-router.post('/login', (req, res) => {
-    if (req.body.password === AUTH_PASSWORD) res.json({ success: true });
-    else res.json({ success: false, msg: "密码错误" });
-});
-router.post('/config', (req, res) => {
-    global.CONFIG = { ...global.CONFIG, ...req.body };
-    global.saveConfig();
-    res.json({ success: true });
-});
-router.get('/status', (req, res) => {
-    res.json({ config: global.CONFIG, state: Scraper.getState(), renamerState: Renamer.getState(), version: global.CURRENT_VERSION });
-});
-router.get('/115/qr', async (req, res) => {
-    try {
-        const data = await Login115.getQrCode();
-        res.json({ success: true, data });
-    } catch (e) { res.json({ success: false, msg: e.message }); }
-});
-router.get('/115/check', async (req, res) => {
-    const { uid, time, sign } = req.query;
-    const result = await Login115.checkStatus(uid, time, sign);
-    if (result.success && result.cookie) {
-        global.CONFIG.cookie115 = result.cookie;
-        global.saveConfig();
-        res.json({ success: true, msg: "登录成功", cookie: result.cookie });
-    } else { res.json(result); }
-});
-router.post('/start', (req, res) => {
-    const autoDl = req.body.autoDownload === true;
-    const source = req.body.source || 'madou';
-    Scraper.start(req.body.type === 'full' ? 50000 : 100, source, autoDl);
-    res.json({ success: true });
-});
-router.post('/stop', (req, res) => {
-    Scraper.stop();
-    Renamer.stop();
-    res.json({ success: true });
-});
-router.post('/renamer/start', (req, res) => {
-    Renamer.start(parseInt(req.body.pages) || 0, req.body.force === true);
-    res.json({ success: true });
-});
-router.post('/push', async (req, res) => {
-    const magnets = req.body.magnets || [];
-    if (!global.CONFIG.cookie115) return res.json({ success: false, msg: "未登录115" });
-    if (magnets.length === 0) return res.json({ success: false, msg: "未选择任务" });
-    let successCount = 0;
-    try {
-        for (const val of magnets) {
-            const parts = val.split('|');
-            const id = parts[0];
-            const magnet = parts.length > 1 ? parts[1].trim() : parts[0].trim();
-            const postData = `url=${encodeURIComponent(magnet)}`;
-            const result = await axios.post('https://115.com/web/lixian/?ct=lixian&ac=add_task_url', postData, {
-                headers: {
-                    'Cookie': global.CONFIG.cookie115,
-                    'User-Agent': global.CONFIG.userAgent,
-                    'Content-Type': 'application/x-www-form-urlencoded'
-                }
-            });
-            if (result.data && result.data.state) {
-                successCount++;
-                await ResourceMgr.markAsPushed(id);
-            }
-            await new Promise(r => setTimeout(r, 500));
-        }
-        res.json({ success: true, count: successCount });
-    } catch (e) { res.json({ success: false, msg: e.message }); }
-});
-
-router.get('/data', async (req, res) => {
-    const filters = {
-        pushed: req.query.pushed || '',
-        renamed: req.query.renamed || ''
-    };
-    const result = await ResourceMgr.getList(parseInt(req.query.page) || 1, 100, filters);
-    res.json(result);
-});
-
-router.get('/export', async (req, res) => {
-    try {
-        const type = req.query.type || 'page';
-        let data = [];
-        if (type === 'all') data = await ResourceMgr.getAllForExport();
-        else {
-            const result = await ResourceMgr.getList(parseInt(req.query.page) || 1, 100);
-            data = result.data;
-        }
-        const parser = new Parser({ fields: ['id', 'title', 'magnets', 'created_at'] });
-        const csv = parser.parse(data);
-        res.header('Content-Type', 'text/csv');
-        res.attachment(`madou_${Date.now()}.csv`);
-        return res.send(csv);
-    } catch (err) { res.status(500).send("Err: " + err.message); }
-});
-
-function compareVersions(v1, v2) {
-    if (!v1 || !v2) return 0;
-    const p1 = v1.split('.').map(Number);
-    const p2 = v2.split('.').map(Number);
-    for (let i = 0; i < Math.max(p1.length, p2.length); i++) {
-        const n1 = p1[i] || 0;
-        const n2 = p2[i] || 0;
-        if (n1 > n2) return 1;
-        if (n1 < n2) return -1;
-    }
-    return 0;
-}
-
-router.post('/system/online-update', async (req, res) => {
-    const updateUrl = global.UPDATE_URL;
-    const options = { timeout: 30000 };
-    if (global.CONFIG.proxy && global.CONFIG.proxy.startsWith('http')) {
-        const agent = new HttpsProxyAgent(global.CONFIG.proxy);
-        options.httpAgent = agent;
-        options.httpsAgent = agent;
-    }
-    const tempScriptPath = '/data/update_temp.sh';
-    const finalScriptPath = '/data/update.sh';
-    try {
-        console.log(`⬇️ 正在检查更新: ${updateUrl}`);
-        const response = await axios({ method: 'get', url: updateUrl, ...options, responseType: 'stream' });
-        const writer = fs.createWriteStream(tempScriptPath);
-        response.data.pipe(writer);
-        writer.on('finish', () => {
-            fs.readFile(tempScriptPath, 'utf8', (err, data) => {
-                if (err) return res.json({ success: false, msg: "无法读取下载的脚本" });
-                const match = data.match(/#\s*VERSION\s*=\s*([0-9\.]+)/);
-                const remoteVersion = match ? match[1] : null;
-                const localVersion = global.CURRENT_VERSION;
-                if (!remoteVersion) return res.json({ success: false, msg: "远程脚本未包含版本号信息" });
-                console.log(`🔍 版本对比: 本地[${localVersion}] vs 云端[${remoteVersion}]`);
-                if (compareVersions(remoteVersion, localVersion) > 0) {
-                    fs.renameSync(tempScriptPath, finalScriptPath);
-                    res.json({ success: true, msg: `发现新版本 V${remoteVersion}，正在升级...` });
-                    setTimeout(() => {
-                        exec(`chmod +x ${finalScriptPath} && sh ${finalScriptPath}`, (error, stdout, stderr) => {
-                            if (error) console.error(`❌ 升级失败: ${error.message}`);
-                            else {
-                                console.log(`✅ 升级日志:\n${stdout}`);
-                                fs.renameSync(finalScriptPath, finalScriptPath + '.bak');
-                                console.log("🔄 重启容器...");
-                                process.exit(0);
-                            }
-                        });
-                    }, 1000);
-                } else {
-                    fs.unlinkSync(tempScriptPath);
-                    res.json({ success: false, msg: `当前已是最新版本 (V${localVersion})` });
-                }
-            });
-        });
-        writer.on('error', (err) => { res.json({ success: false, msg: "文件写入失败" }); });
-    } catch (e) { res.json({ success: false, msg: "连接失败: " + e.message }); }
-});
-module.exports = router;
-EOF
-
-# 4. 更新爬虫模块 (scraper.js) - 支持多源选择
+# 3. 更新爬虫模块 (scraper.js) - 使用 Cookie 发送请求
 echo "📝 更新 /app/modules/scraper.js..."
 cat > /app/modules/scraper.js << 'EOF'
 const axios = require('axios');
@@ -597,11 +430,18 @@ function log(msg, type='info') {
 function getRequest(referer) {
     const options = {
         headers: { 
+            // 修复：默认使用更真实的浏览器 UA
             'User-Agent': global.CONFIG.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36', 
             'Referer': referer 
         },
         timeout: 20000
     };
+    
+    // 新增：如果配置了采集 Cookie，则添加到请求头中
+    if (global.CONFIG.scraperCookie && global.CONFIG.scraperCookie.trim() !== '') {
+        options.headers['Cookie'] = global.CONFIG.scraperCookie.trim();
+    }
+
     if (global.CONFIG.proxy && global.CONFIG.proxy.startsWith('http')) {
         const agent = new HttpsProxyAgent(global.CONFIG.proxy);
         options.httpAgent = agent;
@@ -755,8 +595,8 @@ const Scraper = {
 module.exports = Scraper;
 EOF
 
-# 5. 更新版本号 (package.json)
+# 4. 更新版本号 (package.json)
 echo "📝 更新 /app/package.json..."
-sed -i 's/"version": ".*"/"version": "13.7.1"/' /app/package.json
+sed -i 's/"version": ".*"/"version": "13.7.2"/' /app/package.json
 
 echo "✅ 升级完成，系统将自动重启..."
