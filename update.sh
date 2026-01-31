@@ -1,7 +1,7 @@
 #!/bin/sh
-# VERSION=13.5.0
+# VERSION=13.5.1
 
-echo "🚀 [容器内] 开始执行 V13.5.0 UI 重构升级..."
+echo "🚀 [容器内] 开始执行 V13.5.1 UI 修复..."
 
 cd /app
 
@@ -9,7 +9,7 @@ cd /app
 cat > package.json << 'EOF'
 {
   "name": "madou-omni-system",
-  "version": "13.5.0",
+  "version": "13.5.1",
   "main": "app.js",
   "dependencies": {
     "axios": "^1.6.0",
@@ -25,8 +25,7 @@ cat > package.json << 'EOF'
 }
 EOF
 
-# 2. 更新 UI - 💅 2025 现代设计风格
-mkdir -p public
+# 2. 修复 index.html (CSS 调整)
 cat > public/index.html << 'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -37,11 +36,11 @@ cat > public/index.html << 'EOF'
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
         :root {
-            --primary: #6366f1; /* 靛蓝 */
+            --primary: #6366f1;
             --primary-hover: #4f46e5;
-            --bg-body: #0f172a; /* 深蓝黑 */
+            --bg-body: #0f172a;
             --bg-sidebar: #1e293b;
-            --bg-card: rgba(30, 41, 59, 0.7); /* 半透明 */
+            --bg-card: rgba(30, 41, 59, 0.7);
             --border: rgba(148, 163, 184, 0.1);
             --text-main: #f8fafc;
             --text-sub: #94a3b8;
@@ -49,7 +48,7 @@ cat > public/index.html << 'EOF'
             --warning: #f59e0b;
             --danger: #ef4444;
             --radius: 12px;
-            --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
         }
 
         * { box-sizing: border-box; outline: none; -webkit-tap-highlight-color: transparent; }
@@ -60,14 +59,13 @@ cat > public/index.html << 'EOF'
                               radial-gradient(at 100% 100%, rgba(16, 185, 129, 0.1) 0px, transparent 50%);
             background-attachment: fixed;
             color: var(--text-main);
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            font-family: 'Inter', sans-serif;
             margin: 0;
             display: flex;
             height: 100vh;
             overflow: hidden;
         }
 
-        /* === 侧边栏 === */
         .sidebar {
             width: 260px;
             background: var(--bg-sidebar);
@@ -78,192 +76,102 @@ cat > public/index.html << 'EOF'
             z-index: 10;
         }
 
-        .logo {
-            font-size: 24px;
-            font-weight: 700;
-            color: var(--text-main);
-            margin-bottom: 40px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
+        .logo { font-size: 24px; font-weight: 700; color: var(--text-main); margin-bottom: 40px; }
         .logo span { color: var(--primary); }
 
         .nav-item {
-            display: flex;
-            align-items: center;
-            padding: 12px 16px;
-            color: var(--text-sub);
-            text-decoration: none;
-            border-radius: var(--radius);
-            margin-bottom: 8px;
-            transition: all 0.2s;
-            font-weight: 500;
-            cursor: pointer;
+            display: flex; align-items: center; padding: 12px 16px;
+            color: var(--text-sub); text-decoration: none; border-radius: var(--radius);
+            margin-bottom: 8px; transition: all 0.2s; font-weight: 500; cursor: pointer;
         }
-
         .nav-item:hover { background: rgba(255,255,255,0.05); color: var(--text-main); }
-        .nav-item.active { 
-            background: var(--primary); 
-            color: white; 
-            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
-        }
+        .nav-item.active { background: var(--primary); color: white; box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3); }
         .nav-icon { margin-right: 12px; font-size: 18px; }
 
-        /* === 主内容区 === */
-        .main {
-            flex: 1;
-            padding: 30px;
-            overflow-y: auto;
-            position: relative;
-        }
-
+        .main { flex: 1; padding: 30px; overflow-y: auto; position: relative; }
         h1 { font-size: 24px; margin: 0 0 20px 0; font-weight: 600; }
 
-        /* === 卡片 === */
         .card {
-            background: var(--bg-card);
-            backdrop-filter: blur(12px);
-            -webkit-backdrop-filter: blur(12px);
-            border: 1px solid var(--border);
-            border-radius: var(--radius);
-            padding: 24px;
-            margin-bottom: 24px;
+            background: var(--bg-card); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+            border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; margin-bottom: 24px;
             box-shadow: var(--shadow);
         }
 
-        /* === 按钮 === */
+        /* === 🔥 按钮样式修复：默认 auto 宽度，不占满 === */
         .btn {
             padding: 10px 20px;
-            border: none;
-            border-radius: 8px;
-            font-weight: 500;
-            cursor: pointer;
-            transition: all 0.2s;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-            color: white;
-            font-size: 14px;
+            border: none; border-radius: 8px; font-weight: 500; cursor: pointer;
+            transition: all 0.2s; display: inline-flex; align-items: center; justify-content: center;
+            gap: 8px; color: white; font-size: 14px;
+            width: auto; /* PC端默认不拉伸 */
+            min-width: 100px;
         }
         .btn:active { transform: scale(0.98); }
         .btn-pri { background: var(--primary); }
         .btn-pri:hover { background: var(--primary-hover); }
-        .btn-succ { background: var(--success); }
+        
+        /* 修复 Success 按钮颜色 */
+        .btn-succ { background: var(--success); color: #fff; } 
+        .btn-succ:hover { filter: brightness(1.1); }
+        
         .btn-dang { background: var(--danger); }
         .btn-warn { background: var(--warning); color: #000; }
         .btn-info { background: #3b82f6; }
 
-        /* === 表单元素 === */
         .input-group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 8px; color: var(--text-sub); font-size: 13px; }
         input, select, textarea {
-            width: 100%;
-            background: rgba(0,0,0,0.2);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 10px 12px;
-            color: white;
-            font-family: inherit;
-            transition: 0.2s;
+            width: 100%; background: rgba(0,0,0,0.2); border: 1px solid var(--border);
+            border-radius: 8px; padding: 10px 12px; color: white; font-family: inherit; transition: 0.2s;
         }
-        input:focus, select:focus, textarea:focus {
-            border-color: var(--primary);
-            box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
-        }
+        input:focus, select:focus, textarea:focus { border-color: var(--primary); }
 
-        /* === 日志窗口 === */
+        /* PC端按钮组：左对齐，紧凑 */
+        .btn-row { display: flex; gap: 10px; justify-content: flex-start; margin-bottom: 10px; flex-wrap: wrap; }
+
         .log-box {
-            background: #0b1120;
-            border-radius: 8px;
-            padding: 15px;
-            height: 300px;
-            overflow-y: auto;
-            font-family: 'Menlo', 'Monaco', monospace;
-            font-size: 12px;
-            line-height: 1.6;
-            border: 1px solid var(--border);
+            background: #0b1120; border-radius: 8px; padding: 15px; height: 300px;
+            overflow-y: auto; font-family: monospace; font-size: 12px; line-height: 1.6; border: 1px solid var(--border);
         }
-        .log-entry { margin-bottom: 4px; border-bottom: 1px dashed rgba(255,255,255,0.05); padding-bottom: 2px; }
-        .time { color: var(--text-sub); margin-right: 10px; opacity: 0.7; }
+        .log-box .err{color:#f55} .log-box .warn{color:#fb5} .log-box .suc{color:#5f7}
 
-        /* === 表格 === */
         .table-container { overflow-x: auto; }
         table { width: 100%; border-collapse: collapse; white-space: nowrap; }
         th { text-align: left; color: var(--text-sub); padding: 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
         td { padding: 12px; border-bottom: 1px solid var(--border); color: var(--text-main); font-size: 14px; }
-        tr:last-child td { border-bottom: none; }
-        tr:hover td { background: rgba(255,255,255,0.02); }
-
+        
         .tag { padding: 4px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; }
         .tag-push { background: rgba(16, 185, 129, 0.2); color: #34d399; }
         .tag-ren { background: rgba(59, 130, 246, 0.2); color: #60a5fa; }
 
-        /* === 筛选栏 === */
-        .filter-bar {
-            display: flex;
-            gap: 15px;
-            background: rgba(0,0,0,0.2);
-            padding: 15px;
-            border-radius: 8px;
-            align-items: flex-end;
-            margin-bottom: 20px;
-        }
+        .filter-bar { display: flex; gap: 15px; background: rgba(0,0,0,0.2); padding: 15px; border-radius: 8px; align-items: flex-end; margin-bottom: 20px; }
         .filter-item { flex: 1; }
         .filter-item select { margin-bottom: 0; }
 
-        /* === 锁定屏幕 === */
-        #lock { position: fixed; inset: 0; background: rgba(15, 23, 42, 0.95); backdrop-filter: blur(5px); z-index: 999; display: flex; align-items: center; justify-content: center; }
-        .lock-box { background: var(--bg-sidebar); padding: 40px; border-radius: 16px; width: 100%; max-width: 360px; text-align: center; border: 1px solid var(--border); box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1); }
-
+        #lock { position: fixed; inset: 0; background: rgba(15, 23, 42, 0.95); z-index: 999; display: flex; align-items: center; justify-content: center; }
+        .lock-box { background: var(--bg-sidebar); padding: 40px; border-radius: 16px; width: 100%; max-width: 360px; text-align: center; border: 1px solid var(--border); }
         .hidden { display: none !important; }
 
         /* === 📱 移动端适配 (App 风格) === */
         @media (max-width: 768px) {
-            body { flex-direction: column; height: 100dvh; } /* 动态视口高度 */
-            
+            body { flex-direction: column; height: 100dvh; }
             .sidebar {
-                position: fixed;
-                bottom: 0;
-                left: 0;
-                width: 100%;
-                height: 60px; /* 底部导航栏高度 */
-                flex-direction: row;
-                padding: 0;
-                background: rgba(30, 41, 59, 0.9);
-                backdrop-filter: blur(10px);
-                border-top: 1px solid var(--border);
-                border-right: none;
-                justify-content: space-around;
-                align-items: center;
-                z-index: 100;
+                position: fixed; bottom: 0; left: 0; width: 100%; height: 60px;
+                flex-direction: row; padding: 0; background: rgba(30, 41, 59, 0.9);
+                backdrop-filter: blur(10px); border-top: 1px solid var(--border); border-right: none;
+                justify-content: space-around; align-items: center;
             }
-
             .logo { display: none; }
-
-            .nav-item {
-                flex-direction: column;
-                gap: 4px;
-                padding: 6px;
-                margin: 0;
-                font-size: 10px;
-                border-radius: 8px;
-                background: none !important;
-                color: var(--text-sub);
-                box-shadow: none !important;
-            }
-            
-            .nav-item.active { color: var(--primary); }
+            .nav-item { flex-direction: column; gap: 4px; padding: 6px; margin: 0; font-size: 10px; background: none !important; color: var(--text-sub); }
+            .nav-item.active { color: var(--primary); background: none; box-shadow: none; }
             .nav-icon { margin: 0; font-size: 20px; }
-
-            .main { padding: 15px; padding-bottom: 80px; } /* 留出底部距离 */
+            .main { padding: 15px; padding-bottom: 80px; }
+            
+            /* 手机端按钮：强制全宽 */
+            .btn { width: 100%; margin-right: 0; margin-bottom: 10px; }
+            .btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; } /* 手机上两列布局 */
             
             .filter-bar { flex-direction: column; gap: 10px; }
-            .filter-item { width: 100%; }
-            
-            .btn { width: 100%; justify-content: center; margin-right: 0; margin-bottom: 10px; }
-            .card-header-actions { flex-direction: column; gap: 10px; }
         }
     </style>
 </head>
@@ -280,18 +188,10 @@ cat > public/index.html << 'EOF'
 
     <div class="sidebar">
         <div class="logo">⚡ Madou<span>Pro</span></div>
-        <a class="nav-item active" onclick="show('scraper')">
-            <span class="nav-icon">🕷️</span> 采集
-        </a>
-        <a class="nav-item" onclick="show('renamer')">
-            <span class="nav-icon">📂</span> 整理
-        </a>
-        <a class="nav-item" onclick="show('database')">
-            <span class="nav-icon">💾</span> 资源库
-        </a>
-        <a class="nav-item" onclick="show('settings')">
-            <span class="nav-icon">⚙️</span> 设置
-        </a>
+        <a class="nav-item active" onclick="show('scraper')"><span class="nav-icon">🕷️</span> 采集</a>
+        <a class="nav-item" onclick="show('renamer')"><span class="nav-icon">📂</span> 整理</a>
+        <a class="nav-item" onclick="show('database')"><span class="nav-icon">💾</span> 资源库</a>
+        <a class="nav-item" onclick="show('settings')"><span class="nav-icon">⚙️</span> 设置</a>
     </div>
 
     <div class="main">
@@ -307,11 +207,11 @@ cat > public/index.html << 'EOF'
                     <label for="auto-dl" style="margin:0;cursor:pointer">启用自动推送 (采集成功后直接发往 115)</label>
                 </div>
 
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
-                    <button class="btn btn-succ" onclick="api('start',{type:'inc', autoDownload: getDlState()})">▶ 增量采集 (推荐)</button>
+                <div class="btn-row">
+                    <button class="btn btn-succ" onclick="api('start',{type:'inc', autoDownload: getDlState()})">▶ 增量采集</button>
                     <button class="btn btn-info" onclick="api('start',{type:'full', autoDownload: getDlState()})">♻️ 全量采集</button>
+                    <button class="btn btn-dang" onclick="api('stop')">⏹ 停止</button>
                 </div>
-                <button class="btn btn-dang" style="width:100%" onclick="api('stop')">⏹ 紧急停止</button>
             </div>
 
             <div class="card" style="padding:0;overflow:hidden">
@@ -332,9 +232,9 @@ cat > public/index.html << 'EOF'
                     <label for="r-force" style="margin:0">强制模式 (重新检查已整理项目)</label>
                 </div>
                 
-                <div style="display:flex;gap:10px">
+                <div class="btn-row">
                     <button class="btn btn-pri" style="flex:1" onclick="startRenamer()">🚀 开始整理</button>
-                    <button class="btn btn-dang" onclick="api('stop')">⏹</button>
+                    <button class="btn btn-dang" onclick="api('stop')">⏹ 停止</button>
                 </div>
 
                 <div style="margin-top:20px;display:flex;justify-content:space-around;text-align:center;background:rgba(0,0,0,0.2);padding:15px;border-radius:8px">
@@ -373,9 +273,9 @@ cat > public/index.html << 'EOF'
 
             <div class="card" style="padding:0;overflow:hidden">
                 <div style="padding:15px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:rgba(0,0,0,0.1)">
-                    <div style="display:flex;gap:10px">
-                        <button class="btn btn-info" style="padding:6px 12px;font-size:12px" onclick="pushSelected()">📤 推送选中</button>
-                        <button class="btn btn-warn" style="padding:6px 12px;font-size:12px" onclick="window.open(url('/export?type=all'))">📥 导出CSV</button>
+                    <div class="btn-row" style="margin-bottom:0">
+                        <button class="btn btn-info" style="padding:6px 12px;font-size:12px;min-width:auto" onclick="pushSelected()">📤 推送选中</button>
+                        <button class="btn btn-warn" style="padding:6px 12px;font-size:12px;min-width:auto" onclick="window.open(url('/export?type=all'))">📥 导出CSV</button>
                     </div>
                     <div id="total-count" style="font-size:12px;color:var(--text-sub)">Loading...</div>
                 </div>
@@ -396,9 +296,9 @@ cat > public/index.html << 'EOF'
                 </div>
 
                 <div style="padding:15px;display:flex;justify-content:center;gap:20px;align-items:center;border-top:1px solid var(--border)">
-                    <button class="btn btn-pri" onclick="loadDb(dbPage-1)">上一页</button>
+                    <button class="btn btn-pri" style="min-width:auto" onclick="loadDb(dbPage-1)">上一页</button>
                     <span id="page-info" style="color:var(--text-sub)">1</span>
-                    <button class="btn btn-pri" onclick="loadDb(dbPage+1)">下一页</button>
+                    <button class="btn btn-pri" style="min-width:auto" onclick="loadDb(dbPage+1)">下一页</button>
                 </div>
             </div>
         </div>
@@ -417,9 +317,9 @@ cat > public/index.html << 'EOF'
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-top:15px">
                     <div>
                         <div style="font-size:13px;color:var(--text-sub)">当前版本</div>
-                        <div id="cur-ver" style="font-size:24px;font-weight:bold;color:var(--text-main)">V13.5.0</div>
+                        <div id="cur-ver" style="font-size:24px;font-weight:bold;color:var(--text-main)">V13.5.1</div>
                     </div>
-                    <button class="btn btn-success" onclick="runOnlineUpdate()">检查更新</button>
+                    <button class="btn btn-succ" onclick="runOnlineUpdate()">检查更新</button>
                 </div>
             </div>
 
@@ -443,13 +343,13 @@ cat > public/index.html << 'EOF'
             <h3 style="margin-bottom:20px">请使用 115 App 扫码</h3>
             <div id="qr-img" style="background:white;padding:10px;border-radius:8px;display:inline-block"></div>
             <div id="qr-txt" style="margin:20px 0;color:var(--warning)">正在加载二维码...</div>
-            <button class="btn btn-sub" onclick="document.getElementById('modal').style.display='none'">关闭</button>
+            <button class="btn btn-dang" onclick="document.getElementById('modal').style.display='none'">关闭</button>
         </div>
     </div>
 
     <script src="js/app.js"></script>
     <script>
-        // JS 逻辑保持兼容，仅增加 UI 交互
+        // JS 逻辑
         async function loadDb(p) {
             if(p < 1) return;
             dbPage = p;
@@ -469,7 +369,6 @@ cat > public/index.html << 'EOF'
                     if (r.is_pushed) tags += `<span class="tag tag-push">已推</span> `;
                     if (r.is_renamed) tags += `<span class="tag tag-ren">已整</span>`;
                     const chkValue = `${r.id}|${r.magnets}`;
-                    // 手机端优化显示
                     const magnetShort = r.magnets ? r.magnets.substring(0, 15) + '...' : '无';
                     tbody.innerHTML += `
                         <tr>
@@ -491,10 +390,9 @@ cat > public/index.html << 'EOF'
 EOF
 
 echo "📦 升级依赖..."
-# 仅安装必要依赖
 npm install --registry=https://registry.npmmirror.com
 
 echo "🔄 重启应用..."
 kill 1
 
-echo "✅ V13.5.0 UI 升级完成！请强制刷新浏览器 (Ctrl+F5)"
+echo "✅ V13.5.1 UI 修复完成！"
