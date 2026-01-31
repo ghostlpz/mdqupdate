@@ -3,7 +3,7 @@
 
 echo "🚀 正在部署 V13.9.4 修复版 (增加鼠标模拟 & 延长验证等待时间)..."
 
-# 1. 更新 scraper.js - 修复等待逻辑
+# 1. 更新 scraper.js - 修复等待逻辑 
 echo "📝 更新 /app/modules/scraper.js..."
 cat > /app/modules/scraper.js << 'EOF'
 const axios = require('axios');
