@@ -1,12 +1,26 @@
 #!/bin/bash
-# VERSION = 14.0.0
+# VERSION = 14.1.0 LTS
+# 这是一个全量累积更新包，适用于从 V13.6 或任何中间版本直接升级到 V14.1.0
 
-echo "🔥 正在执行 V14.0.0 全量恢复更新 (从 V13.6 直升最新版)..."
-echo "⏳ 第一步：安装浏览器内核 (这步最慢，请耐心等待)..."
+echo "🔥 [V14.1.0] 开始执行全量升级..."
+echo "📊 目标：修复环境依赖、升级数据库、集成浏览器内核、开启分类采集..."
 
-# 1. 基础环境修复 (阿里云源 + Chromium)
+# ==========================================
+# 1. 系统底层环境修复 (最耗时步骤)
+# ==========================================
+echo "--------------------------------------"
+echo "🛠️ 步骤 1/6: 修复系统环境 & 安装浏览器..."
+echo "--------------------------------------"
+
+# 切换 Alpine 为阿里云源 (解决国内下载慢/失败问题)
 sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
+
+# 更新索引
 apk update
+
+# 安装 Chromium 及其运行库 (解决 Puppeteer 启动失败)
+# 安装 Python3, Make, G++ (解决 sqlite3 安装失败)
+echo "⏳ 正在下载并安装依赖包，请耐心等待..."
 apk add --no-cache \
     chromium \
     nss \
@@ -17,16 +31,38 @@ apk add --no-cache \
     libstdc++ \
     udev \
     ttf-opensans \
-    mesa-gl
+    mesa-gl \
+    python3 \
+    make \
+    g++ \
+    sqlite
 
-echo "✅ 浏览器环境安装完毕！"
+# ==========================================
+# 2. 目录结构修复 (解决 SQLITE_CANTOPEN)
+# ==========================================
+echo "--------------------------------------"
+echo "📂 步骤 2/6: 检查并修复目录权限..."
+echo "--------------------------------------"
 
-# 2. 写入完整的 package.json (包含 puppeteer-core)
-echo "📝 恢复 /app/package.json..."
+# 强制创建数据目录并给予最高权限
+if [ ! -d "/app/data" ]; then
+    echo "⚠️ 检测到 /app/data 缺失，正在创建..."
+    mkdir -p /app/data
+fi
+chmod -R 777 /app/data
+echo "✅ 数据目录检查完毕。"
+
+# ==========================================
+# 3. 依赖清单更新 (解决 sqlite3 丢失)
+# ==========================================
+echo "--------------------------------------"
+echo "📦 步骤 3/6: 更新 package.json 依赖清单..."
+echo "--------------------------------------"
+
 cat > /app/package.json << 'EOF'
 {
   "name": "madou-omni-system",
-  "version": "14.0.0",
+  "version": "14.1.0",
   "main": "app.js",
   "dependencies": {
     "axios": "^1.6.0",
@@ -36,6 +72,7 @@ cat > /app/package.json << 'EOF'
     "express": "^4.18.2",
     "https-proxy-agent": "^7.0.2",
     "mysql2": "^3.6.5",
+    "sqlite3": "^5.1.6",
     "node-schedule": "^2.1.1",
     "json2csv": "^6.0.0-alpha.2",
     "puppeteer-core": "^21.0.0"
@@ -43,16 +80,29 @@ cat > /app/package.json << 'EOF'
 }
 EOF
 
-# 3. 恢复 ResourceMgr (含数据库自动升级逻辑)
-echo "📝 恢复 /app/modules/resource_mgr.js..."
+# ==========================================
+# 4. 数据库模块重构 (支持自动建表、加列、建目录)
+# ==========================================
+echo "--------------------------------------"
+echo "💾 步骤 4/6: 部署 ResourceMgr (SQLite3版)..."
+echo "--------------------------------------"
+
 cat > /app/modules/resource_mgr.js << 'EOF'
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
+const fs = require('fs');
 
-const dbPath = path.join(__dirname, '../data/database.sqlite');
+// 自动修复逻辑：如果目录不存在，代码层面再次尝试创建
+const dataDir = path.join(__dirname, '../data');
+if (!fs.existsSync(dataDir)){
+    try { fs.mkdirSync(dataDir, { recursive: true }); } catch(e){}
+}
+
+const dbPath = path.join(dataDir, 'database.sqlite');
 const db = new sqlite3.Database(dbPath);
 
 db.serialize(() => {
+    // 初始化表结构
     db.run(`CREATE TABLE IF NOT EXISTS resources (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT,
@@ -62,11 +112,15 @@ db.serialize(() => {
         is_renamed INTEGER DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
-    // 自动添加 category 列
-    db.run("ALTER TABLE resources ADD COLUMN category TEXT", (err) => {});
+    
+    // 自动迁移：添加 category 字段 (支持 V13.9.9+ 功能)
+    db.run("ALTER TABLE resources ADD COLUMN category TEXT", (err) => {
+        // 如果列已存在，忽略错误
+    });
 });
 
 const ResourceMgr = {
+    // 保存逻辑：支持 title, link, magnets, category
     save: (title, link, magnets, category = '') => {
         return new Promise((resolve, reject) => {
             const stmt = db.prepare(`INSERT OR IGNORE INTO resources (title, link, magnets, category) VALUES (?, ?, ?, ?)`);
@@ -85,11 +139,17 @@ const ResourceMgr = {
         });
     }
 };
+
 module.exports = ResourceMgr;
 EOF
 
-# 4. 恢复最强爬虫逻辑 (Scraper.js - V13.9.9 版本)
-echo "📝 恢复 /app/modules/scraper.js..."
+# ==========================================
+# 5. 爬虫核心重写 (隐身模式 + 磁力清洗 + 分类)
+# ==========================================
+echo "--------------------------------------"
+echo "🕷️ 步骤 5/6: 部署 Scraper (V14.1.0 最终版)..."
+echo "--------------------------------------"
+
 cat > /app/modules/scraper.js << 'EOF'
 const axios = require('axios');
 const cheerio = require('cheerio');
@@ -112,6 +172,7 @@ function findChromium() {
     return null;
 }
 
+// 🧹 磁力清洗工具
 function cleanMagnet(magnet) {
     if (!magnet) return null;
     const match = magnet.match(/(magnet:\?xt=urn:btih:[a-zA-Z0-9]{32,40})/i);
@@ -163,10 +224,11 @@ async function scrapeMadouQu(limitPages, autoDownload) {
                     const detail = await request.get(link);
                     const match = detail.data.match(/magnet:\?xt=urn:btih:[a-zA-Z0-9]{32,40}/gi);
                     if (match) {
-                        const saved = await ResourceMgr.save(title, link, cleanMagnet(match[0]), 'Madou');
+                        const clean = cleanMagnet(match[0]);
+                        const saved = await ResourceMgr.save(title, link, clean, 'Madou');
                         if(saved) {
                             STATE.totalScraped++;
-                            if(autoDownload) pushTo115(cleanMagnet(match[0]));
+                            if(autoDownload) pushTo115(clean);
                             log(`✅ [入库] ${title.substring(0,10)}...`, 'success');
                         }
                     }
@@ -180,9 +242,9 @@ async function scrapeMadouQu(limitPages, autoDownload) {
 }
 
 async function scrapeXChina(limitPages, autoDownload) {
-    log(`==== 启动 XChina (V14.0 全能版) ====`, 'info');
+    log(`==== 启动 XChina (隐身+分类+清洗版) ====`, 'info');
     const execPath = findChromium();
-    if (!execPath) { log(`❌ 未找到 Chromium`, 'error'); return; }
+    if (!execPath) { log(`❌ 未找到 Chromium (请重启容器生效)`, 'error'); return; }
 
     let browser = null;
     try {
@@ -208,12 +270,13 @@ async function scrapeXChina(limitPages, autoDownload) {
             try {
                 await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
                 const title = await page.title();
-                if (title.includes('Just a moment')) {
-                    log(`🛡️ 等待 Cloudflare...`, 'warn');
-                    await new Promise(r => setTimeout(r, 8000));
+                if (title.includes('Just a moment') || title.includes('Attention')) {
+                    log(`🛡️ 触发 Cloudflare，智能等待中...`, 'warn');
+                    await new Promise(r => setTimeout(r, 8000)); // 基础等待
                 }
+                // 强行读取：忽略超时错误，直接尝试解析
                 try { await page.waitForSelector('.item.video', { timeout: 30000 }); } catch(e) {}
-            } catch(e) { log(`❌ 页面加载异常，尝试读取...`, 'error'); }
+            } catch(e) { log(`❌ 网络波动，尝试强制读取...`, 'error'); }
 
             const items = await page.evaluate((domain) => {
                 const els = document.querySelectorAll('.item.video');
@@ -226,7 +289,7 @@ async function scrapeXChina(limitPages, autoDownload) {
                 });
             }, domain);
 
-            if (items.length === 0) { log(`⚠️ 未找到数据`, 'warn'); break; }
+            if (items.length === 0) { log(`⚠️ 未提取到数据 (可能IP被风控)`, 'warn'); break; }
             log(`[XChina] 发现 ${items.length} 个资源，开始解析...`);
 
             for (const item of items) {
@@ -235,7 +298,7 @@ async function scrapeXChina(limitPages, autoDownload) {
                 try {
                     await page.goto(item.link, { waitUntil: 'domcontentloaded', timeout: 45000 });
                     
-                    // 提取分类
+                    // 🏷️ 核心功能：提取分类
                     const category = await page.evaluate(() => {
                         try {
                             const breadcrumbs = document.querySelectorAll('.path a, .breadcrumb a');
@@ -261,6 +324,8 @@ async function scrapeXChina(limitPages, autoDownload) {
                         try {
                             await page.waitForSelector('a.btn.magnet[href^="magnet:"]', { timeout: 10000 });
                             const rawMagnet = await page.$eval('a.btn.magnet[href^="magnet:"]', el => el.getAttribute('href'));
+                            
+                            // 🧹 核心功能：清洗磁力链
                             const cleanLink = cleanMagnet(rawMagnet);
 
                             if (cleanLink) {
@@ -303,11 +368,42 @@ async function scrapeXChina(limitPages, autoDownload) {
         if (browser) await browser.close();
     }
 }
+
+// 导出定义 (修复 ReferenceError 的关键)
+const Scraper = {
+    getState: () => STATE,
+    stop: () => { STATE.stopSignal = true; },
+    clearLogs: () => { STATE.logs = []; },
+    start: async (limitPages = 5, source = "madou", autoDownload = false) => {
+        if (STATE.isRunning) return;
+        STATE.isRunning = true;
+        STATE.stopSignal = false;
+        STATE.totalScraped = 0;
+        
+        log(`🚀 任务启动 | 源: ${source} | 自动下载: ${autoDownload ? '✅开启' : '❌关闭'}`, 'success');
+
+        if (source === 'madou') {
+            await scrapeMadouQu(limitPages, autoDownload);
+        } else if (source === 'xchina') {
+            await scrapeXChina(limitPages, autoDownload);
+        }
+
+        STATE.isRunning = false;
+        log(`🏁 任务结束，本次共入库 ${STATE.totalScraped} 条`, 'warn');
+    }
+};
+
 module.exports = Scraper;
 EOF
 
-# 5. 恢复 index.html (包含分类显示和设置项)
-echo "📝 恢复 /app/public/index.html..."
+# ==========================================
+# 6. UI 界面更新 (包含分类列显示)
+# ==========================================
+echo "--------------------------------------"
+echo "🎨 步骤 6/6: 更新 Web 界面 (含分类支持)..."
+echo "--------------------------------------"
+
+# 这里的 index.html 是支持分类显示的完整版本
 cat > /app/public/index.html << 'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -500,7 +596,7 @@ cat > /app/public/index.html << 'EOF'
             <div class="card" style="border-left: 4px solid var(--success)">
                 <h3>☁️ 在线升级</h3>
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-top:15px">
-                    <div><div style="font-size:13px;color:var(--text-sub)">当前版本</div><div id="cur-ver" style="font-size:24px;font-weight:bold;color:var(--text-main)">V14.0.0</div></div>
+                    <div><div style="font-size:13px;color:var(--text-sub)">当前版本</div><div id="cur-ver" style="font-size:24px;font-weight:bold;color:var(--text-main)">V14.1.0</div></div>
                     <button class="btn btn-succ" onclick="runOnlineUpdate()">检查更新</button>
                 </div>
             </div>
@@ -569,153 +665,17 @@ cat > /app/public/index.html << 'EOF'
 </html>
 EOF
 
-# 6. 恢复 app.js (支持配置读取)
-echo "📝 恢复 /app/public/js/app.js..."
-cat > /app/public/js/app.js << 'EOF'
-let dbPage = 1;
-let qrTimer = null;
+# ==========================================
+# 7. 收尾：安装依赖并重启
+# ==========================================
+echo "--------------------------------------"
+echo "♻️ 步骤 7/6: 安装 Node 模块并准备重启..."
+echo "--------------------------------------"
 
-async function request(endpoint, options = {}) {
-    const token = localStorage.getItem('token');
-    const headers = { 'Content-Type': 'application/json' };
-    if (token) headers['Authorization'] = token;
-    try {
-        const res = await fetch('/api/' + endpoint, { ...options, headers: { ...headers, ...options.headers } });
-        if (res.status === 401) {
-            localStorage.removeItem('token');
-            document.getElementById('lock').classList.remove('hidden');
-            throw new Error("未登录");
-        }
-        return await res.json();
-    } catch (e) { console.error(e); return { success: false, msg: e.message }; }
-}
+# 使用淘宝源加速 npm install (可选，但在国内非常推荐)
+npm config set registry https://registry.npmmirror.com
+npm install
 
-async function login() {
-    const p = document.getElementById('pass').value;
-    const res = await fetch('/api/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: p}) });
-    const data = await res.json();
-    if (data.success) { localStorage.setItem('token', p); document.getElementById('lock').classList.add('hidden'); } else { document.getElementById('msg').innerText = "密码错误"; }
-}
-
-window.onload = async () => {
-    const res = await request('check-auth');
-    if (res.authenticated) document.getElementById('lock').classList.add('hidden');
-    document.getElementById('pass').addEventListener('keypress', e => { if(e.key === 'Enter') login(); });
-};
-
-function show(id) {
-    document.querySelectorAll('.page').forEach(e => e.classList.add('hidden'));
-    document.getElementById(id).classList.remove('hidden');
-    document.querySelectorAll('.nav-item').forEach(e => e.classList.remove('active'));
-    if(event && event.target) {
-       const target = event.target.closest('.nav-item');
-       if(target) target.classList.add('active');
-    }
-    if(id === 'database') loadDb(1);
-    if(id === 'settings') {
-        setTimeout(async () => {
-            const r = await request('status');
-            if(r.config) {
-                document.getElementById('cfg-proxy').value = r.config.proxy || '';
-                document.getElementById('cfg-cookie').value = r.config.cookie115 || '';
-                document.getElementById('cfg-scraper-cookie').value = r.config.scraperCookie || '';
-                document.getElementById('cfg-ua').value = r.config.userAgent || '';
-            }
-            if(r.version) {
-                document.getElementById('cur-ver').innerText = "V" + r.version;
-            }
-        }, 100);
-    }
-}
-
-function getDlState() { return document.getElementById('auto-dl').checked; }
-async function api(act, body={}) { await request(act, { method: 'POST', body: JSON.stringify(body) }); }
-
-async function startScrape(type) {
-    const source = document.getElementById('src-site').value;
-    const autoDl = getDlState();
-    await api('start', { type, source, autoDownload: autoDl });
-}
-
-async function startRenamer() { const p = document.getElementById('r-pages').value; const f = document.getElementById('r-force').checked; api('renamer/start', { pages: p, force: f }); }
-
-async function runOnlineUpdate() {
-    const btn = event.target;
-    const oldTxt = btn.innerText;
-    btn.innerText = "⏳ 检查中...";
-    btn.disabled = true;
-    try {
-        const res = await request('system/online-update', { method: 'POST' });
-        if(res.success) {
-            alert("🚀 " + res.msg);
-            setTimeout(() => location.reload(), 15000);
-        } else {
-            alert("❌ " + res.msg);
-        }
-    } catch(e) { alert("请求失败"); }
-    btn.innerText = oldTxt;
-    btn.disabled = false;
-}
-
-async function saveCfg() {
-    await request('config', { 
-        method: 'POST', 
-        body: JSON.stringify({ 
-            proxy: document.getElementById('cfg-proxy').value, 
-            cookie115: document.getElementById('cfg-cookie').value,
-            scraperCookie: document.getElementById('cfg-scraper-cookie').value,
-            userAgent: document.getElementById('cfg-ua').value 
-        }) 
-    });
-    alert('保存成功');
-}
-
-function toggleAll(source) { const checkboxes = document.querySelectorAll('.row-chk'); checkboxes.forEach(cb => cb.checked = source.checked); }
-async function pushSelected() {
-    const checkboxes = document.querySelectorAll('.row-chk:checked');
-    if (checkboxes.length === 0) { alert("请先勾选需要推送的资源！"); return; }
-    const magnets = Array.from(checkboxes).map(cb => cb.value);
-    const btn = event.target; const oldText = btn.innerText; btn.innerText = "推送中..."; btn.disabled = true;
-    try { const res = await request('push', { method: 'POST', body: JSON.stringify({ magnets }) }); if (res.success) { alert(`✅ 成功推送 ${res.count} 个任务`); loadDb(dbPage); } else { alert(`❌ 失败: ${res.msg}`); } } catch(e) { alert("网络请求失败"); }
-    btn.innerText = oldText; btn.disabled = false;
-}
-
-let lastLogTimeScr = ""; let lastLogTimeRen = "";
-setInterval(async () => {
-    if(!document.getElementById('lock').classList.contains('hidden')) return;
-    const res = await request('status');
-    if(!res.config) return;
-    const renderLog = (elId, logs, lastTimeVar) => {
-        const el = document.getElementById(elId);
-        if(logs && logs.length > 0) {
-            const latestLog = logs[logs.length-1];
-            const latestSignature = latestLog.time + latestLog.msg;
-            if (latestSignature !== lastTimeVar) {
-                el.innerHTML = logs.map(l => `<div class="log-entry ${l.type==='error'?'err':l.type==='success'?'suc':l.type==='warn'?'warn':''}"><span class="time">[${l.time}]</span> ${l.msg}</div>`).join('');
-                el.scrollTop = el.scrollHeight;
-                return latestSignature;
-            }
-        }
-        return lastTimeVar;
-    };
-    lastLogTimeScr = renderLog('log-scr', res.state.logs, lastLogTimeScr);
-    lastLogTimeRen = renderLog('log-ren', res.renamerState.logs, lastLogTimeRen);
-    document.getElementById('stat-scr').innerText = res.state.totalScraped;
-}, 2000);
-
-async function showQr() {
-    const m = document.getElementById('modal'); m.style.display = 'flex';
-    const res = await request('115/qr'); if(!res.success) return;
-    const { uid, time, sign, qr_url } = res.data;
-    document.getElementById('qr-img').innerHTML = `<img src="${qr_url}" width="200">`;
-    if(qrTimer) clearInterval(qrTimer);
-    qrTimer = setInterval(async () => {
-        const chk = await request(`115/check?uid=${uid}&time=${time}&sign=${sign}`);
-        const txt = document.getElementById('qr-txt');
-        if(chk.success) { txt.innerText = "✅ 成功! 刷新..."; txt.style.color = "#0f0"; clearInterval(qrTimer); setTimeout(() => { m.style.display='none'; location.reload(); }, 1000); }
-        else if (chk.status === 1) { txt.innerText = "📱 已扫码"; txt.style.color = "#fb5"; }
-    }, 1500);
-}
-EOF
-
-echo "✅ 恢复完成 (V14.0.0)，系统正在重启..."
+echo "✅ V14.1.0 升级全部完成！"
+echo "🚀 正在自动退出终端，请在 NAS 界面重启容器..."
+exit
