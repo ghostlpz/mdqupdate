@@ -1,9 +1,9 @@
 #!/bin/bash
-# VERSION = 13.7.2
+# VERSION = 13.7.3
 
-echo "🚀 开始升级 Madou-Omni 到 v13.7.2 (增加 Cookie 穿透支持)..."
+echo "🚀 开始升级 Madou-Omni 到 v13.7.3 (UA/Cookie 双重伪装)..."
 
-# 1. 更新前端界面 (index.html) - 增加 采集Cookie 输入框
+# 1. 更新前端界面 (index.html) - 增加 User-Agent 输入框
 echo "📝 更新 /app/public/index.html..."
 cat > /app/public/index.html << 'EOF'
 <!DOCTYPE html>
@@ -106,7 +106,7 @@ cat > /app/public/index.html << 'EOF'
                     <label>📡 选择采集源</label>
                     <select id="src-site">
                         <option value="madou">MadouQu (麻豆区)</option>
-                        <option value="xchina">XChina (小黄书) - 需配置Cookie</option>
+                        <option value="xchina">XChina (小黄书) - 需配置Cookie & UA</option>
                     </select>
                 </div>
                 <div class="input-group" style="display:flex;align-items:center;gap:10px;background:rgba(255,255,255,0.05);padding:10px;border-radius:8px;margin-bottom:20px">
@@ -208,13 +208,21 @@ cat > /app/public/index.html << 'EOF'
             <div class="card">
                 <h3>网络配置</h3>
                 <div class="input-group">
-                    <label>HTTP 代理 (例如 http://192.168.1.5:7890)</label>
+                    <label>HTTP 代理</label>
                     <input id="cfg-proxy" placeholder="留空则直连">
                 </div>
-                <div class="input-group">
-                    <label>采集 Cookie (解决 403 Forbidden 问题)</label>
-                    <textarea id="cfg-scraper-cookie" rows="3" placeholder="在浏览器登录 xchina/madouqu，F12 -> 网络 -> 复制请求头中的 Cookie 粘贴至此"></textarea>
+                <div style="background:rgba(0,0,0,0.2);padding:15px;border-radius:8px;margin-bottom:15px">
+                    <h4 style="margin-top:0;margin-bottom:10px;color:var(--warning)">🛡️ 反爬虫穿透配置 (必填)</h4>
+                    <div class="input-group">
+                        <label>采集 Cookie (从浏览器 F12 网络请求中复制)</label>
+                        <textarea id="cfg-scraper-cookie" rows="3" placeholder="cf_clearance=...; other=..."></textarea>
+                    </div>
+                    <div class="input-group">
+                        <label>User-Agent (浏览器标识，必须与 Cookie 来源一致)</label>
+                        <textarea id="cfg-ua" rows="2" placeholder="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)..."></textarea>
+                    </div>
                 </div>
+
                 <div class="input-group">
                     <label>115 Cookie</label>
                     <textarea id="cfg-cookie" rows="4" placeholder="UID=...; CID=...; SEID=..."></textarea>
@@ -262,7 +270,7 @@ cat > /app/public/index.html << 'EOF'
 </html>
 EOF
 
-# 2. 更新前端逻辑 (app.js) - 支持保存和读取新 Cookie
+# 2. 更新前端逻辑 (app.js) - 读取和保存 UA
 echo "📝 更新 /app/public/js/app.js..."
 cat > /app/public/js/app.js << 'EOF'
 let dbPage = 1;
@@ -311,8 +319,9 @@ function show(id) {
             if(r.config) {
                 document.getElementById('cfg-proxy').value = r.config.proxy || '';
                 document.getElementById('cfg-cookie').value = r.config.cookie115 || '';
-                // 新增：读取采集 Cookie
                 document.getElementById('cfg-scraper-cookie').value = r.config.scraperCookie || '';
+                // 读取 UA
+                document.getElementById('cfg-ua').value = r.config.userAgent || '';
             }
             if(r.version) {
                 document.getElementById('cur-ver').innerText = "V" + r.version;
@@ -351,13 +360,13 @@ async function runOnlineUpdate() {
 }
 
 async function saveCfg() {
-    // 新增：保存采集 Cookie
     await request('config', { 
         method: 'POST', 
         body: JSON.stringify({ 
             proxy: document.getElementById('cfg-proxy').value, 
             cookie115: document.getElementById('cfg-cookie').value,
-            scraperCookie: document.getElementById('cfg-scraper-cookie').value 
+            scraperCookie: document.getElementById('cfg-scraper-cookie').value,
+            userAgent: document.getElementById('cfg-ua').value 
         }) 
     });
     alert('保存成功');
@@ -411,7 +420,7 @@ async function showQr() {
 }
 EOF
 
-# 3. 更新爬虫模块 (scraper.js) - 使用 Cookie 发送请求
+# 3. 更新爬虫模块 (scraper.js) - 优先使用配置的 UA
 echo "📝 更新 /app/modules/scraper.js..."
 cat > /app/modules/scraper.js << 'EOF'
 const axios = require('axios');
@@ -428,16 +437,23 @@ function log(msg, type='info') {
 }
 
 function getRequest(referer) {
+    // 默认 User-Agent (作为后备)
+    const defaultUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    
+    // 优先使用用户配置的 UA，其次使用 Config 对象中的，最后使用默认
+    const userAgent = (global.CONFIG.userAgent && global.CONFIG.userAgent.trim() !== '') 
+        ? global.CONFIG.userAgent.trim() 
+        : defaultUA;
+
     const options = {
         headers: { 
-            // 修复：默认使用更真实的浏览器 UA
-            'User-Agent': global.CONFIG.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36', 
+            'User-Agent': userAgent,
             'Referer': referer 
         },
         timeout: 20000
     };
     
-    // 新增：如果配置了采集 Cookie，则添加到请求头中
+    // 如果配置了采集 Cookie，则添加到请求头中
     if (global.CONFIG.scraperCookie && global.CONFIG.scraperCookie.trim() !== '') {
         options.headers['Cookie'] = global.CONFIG.scraperCookie.trim();
     }
@@ -457,7 +473,7 @@ async function pushTo115(magnet) {
         const res = await axios.post('https://115.com/web/lixian/?ct=lixian&ac=add_task_url', postData, {
             headers: {
                 'Cookie': global.CONFIG.cookie115,
-                'User-Agent': global.CONFIG.userAgent,
+                'User-Agent': global.CONFIG.userAgent || 'Mozilla/5.0',
                 'Content-Type': 'application/x-www-form-urlencoded'
             }
         });
@@ -597,6 +613,6 @@ EOF
 
 # 4. 更新版本号 (package.json)
 echo "📝 更新 /app/package.json..."
-sed -i 's/"version": ".*"/"version": "13.7.2"/' /app/package.json
+sed -i 's/"version": ".*"/"version": "13.7.3"/' /app/package.json
 
 echo "✅ 升级完成，系统将自动重启..."
