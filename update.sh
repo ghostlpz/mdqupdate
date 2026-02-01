@@ -1,410 +1,11 @@
 #!/bin/bash
-# VERSION = 14.1.0 LTS
-# 这是一个全量累积更新包，适用于从 V13.6 或任何中间版本直接升级到 V14.1.0
+# VERSION = 13.7.0
 
-echo "🔥 [V14.1.0] 开始执行全量升级..."
-echo "📊 目标：修复环境依赖、升级数据库、集成浏览器内核、开启分类采集..."
+echo "🚀 开始升级 Madou-Omni 到 v13.7.0 (支持多源采集)..."
 
-# ==========================================
-# 1. 系统底层环境修复 (最耗时步骤)
-# ==========================================
-echo "--------------------------------------"
-echo "🛠️ 步骤 1/6: 修复系统环境 & 安装浏览器..."
-echo "--------------------------------------"
-
-# 切换 Alpine 为阿里云源 (解决国内下载慢/失败问题)
-sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
-
-# 更新索引
-apk update
-
-# 安装 Chromium 及其运行库 (解决 Puppeteer 启动失败)
-# 安装 Python3, Make, G++ (解决 sqlite3 安装失败)
-echo "⏳ 正在下载并安装依赖包，请耐心等待..."
-apk add --no-cache \
-    chromium \
-    nss \
-    freetype \
-    harfbuzz \
-    ca-certificates \
-    ttf-freefont \
-    libstdc++ \
-    udev \
-    ttf-opensans \
-    mesa-gl \
-    python3 \
-    make \
-    g++ \
-    sqlite
-
-# ==========================================
-# 2. 目录结构修复 (解决 SQLITE_CANTOPEN)
-# ==========================================
-echo "--------------------------------------"
-echo "📂 步骤 2/6: 检查并修复目录权限..."
-echo "--------------------------------------"
-
-# 强制创建数据目录并给予最高权限
-if [ ! -d "/app/data" ]; then
-    echo "⚠️ 检测到 /app/data 缺失，正在创建..."
-    mkdir -p /app/data
-fi
-chmod -R 777 /app/data
-echo "✅ 数据目录检查完毕。"
-
-# ==========================================
-# 3. 依赖清单更新 (解决 sqlite3 丢失)
-# ==========================================
-echo "--------------------------------------"
-echo "📦 步骤 3/6: 更新 package.json 依赖清单..."
-echo "--------------------------------------"
-
-cat > /app/package.json << 'EOF'
-{
-  "name": "madou-omni-system",
-  "version": "14.1.0",
-  "main": "app.js",
-  "dependencies": {
-    "axios": "^1.6.0",
-    "cheerio": "^1.0.0-rc.12",
-    "cookie-parser": "^1.4.6",
-    "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "https-proxy-agent": "^7.0.2",
-    "mysql2": "^3.6.5",
-    "sqlite3": "^5.1.6",
-    "node-schedule": "^2.1.1",
-    "json2csv": "^6.0.0-alpha.2",
-    "puppeteer-core": "^21.0.0"
-  }
-}
-EOF
-
-# ==========================================
-# 4. 数据库模块重构 (支持自动建表、加列、建目录)
-# ==========================================
-echo "--------------------------------------"
-echo "💾 步骤 4/6: 部署 ResourceMgr (SQLite3版)..."
-echo "--------------------------------------"
-
-cat > /app/modules/resource_mgr.js << 'EOF'
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
-const fs = require('fs');
-
-// 自动修复逻辑：如果目录不存在，代码层面再次尝试创建
-const dataDir = path.join(__dirname, '../data');
-if (!fs.existsSync(dataDir)){
-    try { fs.mkdirSync(dataDir, { recursive: true }); } catch(e){}
-}
-
-const dbPath = path.join(dataDir, 'database.sqlite');
-const db = new sqlite3.Database(dbPath);
-
-db.serialize(() => {
-    // 初始化表结构
-    db.run(`CREATE TABLE IF NOT EXISTS resources (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT,
-        link TEXT UNIQUE,
-        magnets TEXT,
-        is_pushed INTEGER DEFAULT 0,
-        is_renamed INTEGER DEFAULT 0,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
-    
-    // 自动迁移：添加 category 字段 (支持 V13.9.9+ 功能)
-    db.run("ALTER TABLE resources ADD COLUMN category TEXT", (err) => {
-        // 如果列已存在，忽略错误
-    });
-});
-
-const ResourceMgr = {
-    // 保存逻辑：支持 title, link, magnets, category
-    save: (title, link, magnets, category = '') => {
-        return new Promise((resolve, reject) => {
-            const stmt = db.prepare(`INSERT OR IGNORE INTO resources (title, link, magnets, category) VALUES (?, ?, ?, ?)`);
-            stmt.run(title, link, magnets, category, function(err) {
-                if (err) reject(err);
-                else resolve(this.changes > 0);
-            });
-            stmt.finalize();
-        });
-    },
-    markAsPushedByLink: (link) => {
-        return new Promise((resolve, reject) => {
-            db.run("UPDATE resources SET is_pushed = 1 WHERE link = ?", [link], (err) => {
-                if (err) reject(err); else resolve(true);
-            });
-        });
-    }
-};
-
-module.exports = ResourceMgr;
-EOF
-
-# ==========================================
-# 5. 爬虫核心重写 (隐身模式 + 磁力清洗 + 分类)
-# ==========================================
-echo "--------------------------------------"
-echo "🕷️ 步骤 5/6: 部署 Scraper (V14.1.0 最终版)..."
-echo "--------------------------------------"
-
-cat > /app/modules/scraper.js << 'EOF'
-const axios = require('axios');
-const cheerio = require('cheerio');
-const { HttpsProxyAgent } = require('https-proxy-agent');
-const puppeteer = require('puppeteer-core');
-const ResourceMgr = require('./resource_mgr');
-const fs = require('fs');
-
-let STATE = { isRunning: false, stopSignal: false, logs: [], totalScraped: 0 };
-
-function log(msg, type='info') {
-    STATE.logs.push({ time: new Date().toLocaleTimeString(), msg, type });
-    if (STATE.logs.length > 200) STATE.logs.shift();
-    console.log(`[Scraper] ${msg}`);
-}
-
-function findChromium() {
-    const paths = ['/usr/bin/chromium-browser', '/usr/bin/chromium', '/usr/bin/google-chrome-stable'];
-    for (const p of paths) { if (fs.existsSync(p)) return p; }
-    return null;
-}
-
-// 🧹 磁力清洗工具
-function cleanMagnet(magnet) {
-    if (!magnet) return null;
-    const match = magnet.match(/(magnet:\?xt=urn:btih:[a-zA-Z0-9]{32,40})/i);
-    return match ? match[1] : magnet;
-}
-
-function getRequest() {
-    const userAgent = global.CONFIG.userAgent || 'Mozilla/5.0';
-    const options = { headers: { 'User-Agent': userAgent }, timeout: 20000 };
-    if (global.CONFIG.proxy && global.CONFIG.proxy.startsWith('http')) {
-        const agent = new HttpsProxyAgent(global.CONFIG.proxy);
-        options.httpAgent = agent;
-        options.httpsAgent = agent;
-    }
-    return axios.create(options);
-}
-
-async function pushTo115(magnet) {
-    if (!global.CONFIG.cookie115) return false;
-    try {
-        const postData = `url=${encodeURIComponent(magnet)}`;
-        await axios.post('https://115.com/web/lixian/?ct=lixian&ac=add_task_url', postData, {
-            headers: {
-                'Cookie': global.CONFIG.cookie115,
-                'User-Agent': global.CONFIG.userAgent || 'Mozilla/5.0',
-                'Content-Type': 'application/x-www-form-urlencoded'
-            }
-        });
-        return true;
-    } catch (e) { return false; }
-}
-
-async function scrapeMadouQu(limitPages, autoDownload) {
-    let page = 1;
-    let url = "https://madouqu.com/";
-    const request = getRequest();
-    log(`==== 启动 MadouQu 采集 ====`, 'info');
-    while (page <= limitPages && !STATE.stopSignal) {
-        try {
-            const res = await request.get(url);
-            const $ = cheerio.load(res.data);
-            const posts = $('article h2.entry-title a, h2.entry-title a');
-            if (posts.length === 0) break;
-            for (let i = 0; i < posts.length; i++) {
-                if (STATE.stopSignal) break;
-                const link = $(posts[i]).attr('href');
-                const title = $(posts[i]).text().trim();
-                try {
-                    const detail = await request.get(link);
-                    const match = detail.data.match(/magnet:\?xt=urn:btih:[a-zA-Z0-9]{32,40}/gi);
-                    if (match) {
-                        const clean = cleanMagnet(match[0]);
-                        const saved = await ResourceMgr.save(title, link, clean, 'Madou');
-                        if(saved) {
-                            STATE.totalScraped++;
-                            if(autoDownload) pushTo115(clean);
-                            log(`✅ [入库] ${title.substring(0,10)}...`, 'success');
-                        }
-                    }
-                } catch(e) {}
-                await new Promise(r => setTimeout(r, 1000));
-            }
-            const next = $('a.next').attr('href');
-            if (next) { url = next; page++; } else break;
-        } catch (e) { log(`Error: ${e.message}`, 'error'); break; }
-    }
-}
-
-async function scrapeXChina(limitPages, autoDownload) {
-    log(`==== 启动 XChina (隐身+分类+清洗版) ====`, 'info');
-    const execPath = findChromium();
-    if (!execPath) { log(`❌ 未找到 Chromium (请重启容器生效)`, 'error'); return; }
-
-    let browser = null;
-    try {
-        const launchArgs = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-blink-features=AutomationControlled', '--window-size=1280,800'];
-        if (global.CONFIG.proxy) {
-            const proxyUrl = global.CONFIG.proxy.replace('http://', '').replace('https://', '');
-            launchArgs.push(`--proxy-server=${proxyUrl}`);
-        }
-
-        browser = await puppeteer.launch({ executablePath: execPath, headless: 'new', args: launchArgs });
-        const page = await browser.newPage();
-        
-        await page.evaluateOnNewDocument(() => { Object.defineProperty(navigator, 'webdriver', { get: () => false }); });
-        await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-
-        let currPage = 1;
-        let url = "https://xchina.co/videos.html";
-        const domain = "https://xchina.co";
-
-        while (currPage <= limitPages && !STATE.stopSignal) {
-            log(`[XChina] 正在加载第 ${currPage} 页...`);
-            
-            try {
-                await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-                const title = await page.title();
-                if (title.includes('Just a moment') || title.includes('Attention')) {
-                    log(`🛡️ 触发 Cloudflare，智能等待中...`, 'warn');
-                    await new Promise(r => setTimeout(r, 8000)); // 基础等待
-                }
-                // 强行读取：忽略超时错误，直接尝试解析
-                try { await page.waitForSelector('.item.video', { timeout: 30000 }); } catch(e) {}
-            } catch(e) { log(`❌ 网络波动，尝试强制读取...`, 'error'); }
-
-            const items = await page.evaluate((domain) => {
-                const els = document.querySelectorAll('.item.video');
-                return Array.from(els).map(el => ({
-                    title: el.querySelector('.text .title a')?.innerText.trim(),
-                    link: el.querySelector('.text .title a')?.getAttribute('href')
-                })).filter(i => i.title && i.link).map(i => {
-                    if(i.link.startsWith('/')) i.link = domain + i.link;
-                    return i;
-                });
-            }, domain);
-
-            if (items.length === 0) { log(`⚠️ 未提取到数据 (可能IP被风控)`, 'warn'); break; }
-            log(`[XChina] 发现 ${items.length} 个资源，开始解析...`);
-
-            for (const item of items) {
-                if (STATE.stopSignal) break;
-                
-                try {
-                    await page.goto(item.link, { waitUntil: 'domcontentloaded', timeout: 45000 });
-                    
-                    // 🏷️ 核心功能：提取分类
-                    const category = await page.evaluate(() => {
-                        try {
-                            const breadcrumbs = document.querySelectorAll('.path a, .breadcrumb a');
-                            if (breadcrumbs.length > 0) return breadcrumbs[breadcrumbs.length - 1].innerText.trim();
-                            const bodyText = document.body.innerText;
-                            const match = bodyText.match(/中文AV\s*-\s*([^\s\n]+)/);
-                            if (match) return match[1];
-                            return '未分类';
-                        } catch(e) { return '未知'; }
-                    });
-
-                    const dlLink = await page.evaluate((domain) => {
-                        const a = document.querySelector('a[href*="/download/id-"]');
-                        if(!a) return null;
-                        let href = a.getAttribute('href');
-                        if(href && href.startsWith('/')) return domain + href;
-                        return href;
-                    }, domain);
-                    
-                    if (dlLink) {
-                        const fullDlLink = dlLink.startsWith('/') ? domain + dlLink : dlLink;
-                        await page.goto(fullDlLink, { waitUntil: 'domcontentloaded', timeout: 45000 });
-                        try {
-                            await page.waitForSelector('a.btn.magnet[href^="magnet:"]', { timeout: 10000 });
-                            const rawMagnet = await page.$eval('a.btn.magnet[href^="magnet:"]', el => el.getAttribute('href'));
-                            
-                            // 🧹 核心功能：清洗磁力链
-                            const cleanLink = cleanMagnet(rawMagnet);
-
-                            if (cleanLink) {
-                                const saved = await ResourceMgr.save(item.title, item.link, cleanLink, category);
-                                if(saved) {
-                                    STATE.totalScraped++;
-                                    let extraMsg = "";
-                                    if(autoDownload) {
-                                        await pushTo115(cleanLink);
-                                        extraMsg = " | 📥 推送OK";
-                                    }
-                                    log(`✅ [${category}] ${item.title.substring(0, 10)}...${extraMsg}`, 'success');
-                                }
-                            }
-                        } catch(e) {}
-                    }
-                } catch(e) { log(`❌ 解析失败`, 'warn'); }
-                await new Promise(r => setTimeout(r, 1000));
-            }
-
-            const nextHref = await page.evaluate((domain) => {
-                const a = document.querySelector('.pagination a:contains("下一页")') || 
-                          Array.from(document.querySelectorAll('.pagination a')).find(el => el.textContent.includes('下一页') || el.textContent.includes('Next'));
-                if(!a) return null;
-                let href = a.getAttribute('href');
-                if(href && href.startsWith('/')) return domain + href;
-                return href;
-            }, domain);
-
-            if (nextHref) {
-                url = nextHref;
-                currPage++;
-                await new Promise(r => setTimeout(r, 2000));
-            } else { break; }
-        }
-
-    } catch (e) {
-        log(`🔥 浏览器崩溃: ${e.message}`, 'error');
-    } finally {
-        if (browser) await browser.close();
-    }
-}
-
-// 导出定义 (修复 ReferenceError 的关键)
-const Scraper = {
-    getState: () => STATE,
-    stop: () => { STATE.stopSignal = true; },
-    clearLogs: () => { STATE.logs = []; },
-    start: async (limitPages = 5, source = "madou", autoDownload = false) => {
-        if (STATE.isRunning) return;
-        STATE.isRunning = true;
-        STATE.stopSignal = false;
-        STATE.totalScraped = 0;
-        
-        log(`🚀 任务启动 | 源: ${source} | 自动下载: ${autoDownload ? '✅开启' : '❌关闭'}`, 'success');
-
-        if (source === 'madou') {
-            await scrapeMadouQu(limitPages, autoDownload);
-        } else if (source === 'xchina') {
-            await scrapeXChina(limitPages, autoDownload);
-        }
-
-        STATE.isRunning = false;
-        log(`🏁 任务结束，本次共入库 ${STATE.totalScraped} 条`, 'warn');
-    }
-};
-
-module.exports = Scraper;
-EOF
-
-# ==========================================
-# 6. UI 界面更新 (包含分类列显示)
-# ==========================================
-echo "--------------------------------------"
-echo "🎨 步骤 6/6: 更新 Web 界面 (含分类支持)..."
-echo "--------------------------------------"
-
-# 这里的 index.html 是支持分类显示的完整版本
-cat > /app/public/index.html << 'EOF'
+# 1. 更新前端界面 (index.html) - 增加数据源选择器
+echo "📝 更新 app/public/index.html..."
+cat > /app/app/public/index.html << 'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -505,7 +106,7 @@ cat > /app/public/index.html << 'EOF'
                     <label>📡 选择采集源</label>
                     <select id="src-site">
                         <option value="madou">MadouQu (麻豆区)</option>
-                        <option value="xchina">XChina (浏览器模式)</option>
+                        <option value="xchina">XChina (小黄书)</option>
                     </select>
                 </div>
                 <div class="input-group" style="display:flex;align-items:center;gap:10px;background:rgba(255,255,255,0.05);padding:10px;border-radius:8px;margin-bottom:20px">
@@ -537,6 +138,11 @@ cat > /app/public/index.html << 'EOF'
                 <div class="btn-row">
                     <button class="btn btn-pri" onclick="startRenamer()">🚀 开始整理</button>
                     <button class="btn btn-dang" onclick="api('stop')">⏹ 停止</button>
+                </div>
+                <div style="margin-top:20px;display:flex;justify-content:space-around;text-align:center;background:rgba(0,0,0,0.2);padding:15px;border-radius:8px">
+                    <div><div style="font-size:12px;color:var(--text-sub)">成功</div><div id="stat-suc" style="color:var(--success);font-size:20px;font-weight:bold">0</div></div>
+                    <div><div style="font-size:12px;color:var(--text-sub)">失败</div><div id="stat-fail" style="color:var(--danger);font-size:20px;font-weight:bold">0</div></div>
+                    <div><div style="font-size:12px;color:var(--text-sub)">跳过</div><div id="stat-skip" style="color:var(--text-sub);font-size:20px;font-weight:bold">0</div></div>
                 </div>
             </div>
             <div class="card" style="padding:0;overflow:hidden">
@@ -571,7 +177,6 @@ cat > /app/public/index.html << 'EOF'
                                 <th class="col-chk"><input type="checkbox" onclick="toggleAll(this)"></th>
                                 <th class="col-id">ID</th>
                                 <th class="col-title">标题</th>
-                                <th style="width:80px">分类</th>
                                 <th>磁力链</th>
                                 <th class="col-time">时间</th>
                             </tr>
@@ -596,7 +201,7 @@ cat > /app/public/index.html << 'EOF'
             <div class="card" style="border-left: 4px solid var(--success)">
                 <h3>☁️ 在线升级</h3>
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-top:15px">
-                    <div><div style="font-size:13px;color:var(--text-sub)">当前版本</div><div id="cur-ver" style="font-size:24px;font-weight:bold;color:var(--text-main)">V14.1.0</div></div>
+                    <div><div style="font-size:13px;color:var(--text-sub)">当前版本</div><div id="cur-ver" style="font-size:24px;font-weight:bold;color:var(--text-main)">V13.6.0</div></div>
                     <button class="btn btn-succ" onclick="runOnlineUpdate()">检查更新</button>
                 </div>
             </div>
@@ -605,17 +210,6 @@ cat > /app/public/index.html << 'EOF'
                 <div class="input-group">
                     <label>HTTP 代理</label>
                     <input id="cfg-proxy" placeholder="留空则直连">
-                </div>
-                <div style="background:rgba(0,0,0,0.2);padding:15px;border-radius:8px;margin-bottom:15px">
-                    <h4 style="margin-top:0;margin-bottom:10px;color:var(--warning)">🛡️ 浏览器伪装配置</h4>
-                    <div class="input-group">
-                        <label>User-Agent</label>
-                        <textarea id="cfg-ua" rows="2" placeholder="Mozilla/5.0..."></textarea>
-                    </div>
-                    <div class="input-group">
-                        <label>Cookie (备用)</label>
-                        <textarea id="cfg-scraper-cookie" rows="3" placeholder="可选填"></textarea>
-                    </div>
                 </div>
                 <div class="input-group">
                     <label>115 Cookie</label>
@@ -655,8 +249,7 @@ cat > /app/public/index.html << 'EOF'
                     if (r.is_renamed) tags += `<span class="tag tag-ren">已整</span>`;
                     const chkValue = `${r.id}|${r.magnets}`;
                     const magnetText = r.magnets || '';
-                    const category = r.category || '未分类';
-                    tbody.innerHTML += `<tr><td><input type="checkbox" class="tbl-chk row-chk" value="${chkValue}"></td><td><span style="opacity:0.5">#</span>${r.id}</td><td class="title-cell"><div style="margin-bottom:4px">${r.title}</div><div>${tags}</div></td><td><span class="tag" style="background:rgba(255,255,255,0.1);">${category}</span></td><td class="magnet-cell">${magnetText}</td><td style="font-size:12px;color:var(--text-sub)">${time}</td></tr>`;
+                    tbody.innerHTML += `<tr><td><input type="checkbox" class="tbl-chk row-chk" value="${chkValue}"></td><td><span style="opacity:0.5">#</span>${r.id}</td><td class="title-cell"><div style="margin-bottom:4px">${r.title}</div><div>${tags}</div></td><td class="magnet-cell">${magnetText}</td><td style="font-size:12px;color:var(--text-sub)">${time}</td></tr>`;
                 });
             }
         }
@@ -665,17 +258,503 @@ cat > /app/public/index.html << 'EOF'
 </html>
 EOF
 
-# ==========================================
-# 7. 收尾：安装依赖并重启
-# ==========================================
-echo "--------------------------------------"
-echo "♻️ 步骤 7/6: 安装 Node 模块并准备重启..."
-echo "--------------------------------------"
+# 2. 更新前端逻辑 (app.js) - 发送 source 参数
+echo "📝 更新 app/public/js/app.js..."
+cat > /app/app/public/js/app.js << 'EOF'
+let dbPage = 1;
+let qrTimer = null;
 
-# 使用淘宝源加速 npm install (可选，但在国内非常推荐)
-npm config set registry https://registry.npmmirror.com
-npm install
+async function request(endpoint, options = {}) {
+    const token = localStorage.getItem('token');
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = token;
+    try {
+        const res = await fetch('/api/' + endpoint, { ...options, headers: { ...headers, ...options.headers } });
+        if (res.status === 401) {
+            localStorage.removeItem('token');
+            document.getElementById('lock').classList.remove('hidden');
+            throw new Error("未登录");
+        }
+        return await res.json();
+    } catch (e) { console.error(e); return { success: false, msg: e.message }; }
+}
 
-echo "✅ V14.1.0 升级全部完成！"
-echo "🚀 正在自动退出终端，请在 NAS 界面重启容器..."
-exit
+async function login() {
+    const p = document.getElementById('pass').value;
+    const res = await fetch('/api/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: p}) });
+    const data = await res.json();
+    if (data.success) { localStorage.setItem('token', p); document.getElementById('lock').classList.add('hidden'); } else { document.getElementById('msg').innerText = "密码错误"; }
+}
+
+window.onload = async () => {
+    const res = await request('check-auth');
+    if (res.authenticated) document.getElementById('lock').classList.add('hidden');
+    document.getElementById('pass').addEventListener('keypress', e => { if(e.key === 'Enter') login(); });
+};
+
+function show(id) {
+    document.querySelectorAll('.page').forEach(e => e.classList.add('hidden'));
+    document.getElementById(id).classList.remove('hidden');
+    document.querySelectorAll('.nav-item').forEach(e => e.classList.remove('active'));
+    if(event && event.target) {
+       const target = event.target.closest('.nav-item');
+       if(target) target.classList.add('active');
+    }
+    if(id === 'database') loadDb(1);
+    if(id === 'settings') {
+        setTimeout(async () => {
+            const r = await request('status');
+            if(r.config) {
+                document.getElementById('cfg-proxy').value = r.config.proxy || '';
+                document.getElementById('cfg-cookie').value = r.config.cookie115 || '';
+            }
+            if(r.version) {
+                document.getElementById('cur-ver').innerText = "V" + r.version;
+            }
+        }, 100);
+    }
+}
+
+function getDlState() { return document.getElementById('auto-dl').checked; }
+async function api(act, body={}) { await request(act, { method: 'POST', body: JSON.stringify(body) }); }
+
+// 新增：开始采集的包装函数，获取选中的源
+async function startScrape(type) {
+    const source = document.getElementById('src-site').value;
+    const autoDl = getDlState();
+    await api('start', { type, source, autoDownload: autoDl });
+}
+
+async function startRenamer() { const p = document.getElementById('r-pages').value; const f = document.getElementById('r-force').checked; api('renamer/start', { pages: p, force: f }); }
+
+async function runOnlineUpdate() {
+    const btn = event.target;
+    const oldTxt = btn.innerText;
+    btn.innerText = "⏳ 检查中...";
+    btn.disabled = true;
+    try {
+        const res = await request('system/online-update', { method: 'POST' });
+        if(res.success) {
+            alert("🚀 " + res.msg);
+            setTimeout(() => location.reload(), 15000);
+        } else {
+            alert("❌ " + res.msg);
+        }
+    } catch(e) { alert("请求失败"); }
+    btn.innerText = oldTxt;
+    btn.disabled = false;
+}
+
+async function saveCfg() {
+    await request('config', { method: 'POST', body: JSON.stringify({ proxy: document.getElementById('cfg-proxy').value, cookie115: document.getElementById('cfg-cookie').value }) });
+    alert('保存成功');
+}
+
+function toggleAll(source) { const checkboxes = document.querySelectorAll('.row-chk'); checkboxes.forEach(cb => cb.checked = source.checked); }
+async function pushSelected() {
+    const checkboxes = document.querySelectorAll('.row-chk:checked');
+    if (checkboxes.length === 0) { alert("请先勾选需要推送的资源！"); return; }
+    const magnets = Array.from(checkboxes).map(cb => cb.value);
+    const btn = event.target; const oldText = btn.innerText; btn.innerText = "推送中..."; btn.disabled = true;
+    try { const res = await request('push', { method: 'POST', body: JSON.stringify({ magnets }) }); if (res.success) { alert(`✅ 成功推送 ${res.count} 个任务`); loadDb(dbPage); } else { alert(`❌ 失败: ${res.msg}`); } } catch(e) { alert("网络请求失败"); }
+    btn.innerText = oldText; btn.disabled = false;
+}
+
+let lastLogTimeScr = ""; let lastLogTimeRen = "";
+setInterval(async () => {
+    if(!document.getElementById('lock').classList.contains('hidden')) return;
+    const res = await request('status');
+    if(!res.config) return;
+    const renderLog = (elId, logs, lastTimeVar) => {
+        const el = document.getElementById(elId);
+        if(logs && logs.length > 0) {
+            const latestLog = logs[logs.length-1];
+            const latestSignature = latestLog.time + latestLog.msg;
+            if (latestSignature !== lastTimeVar) {
+                el.innerHTML = logs.map(l => `<div class="log-entry ${l.type==='error'?'err':l.type==='success'?'suc':l.type==='warn'?'warn':''}"><span class="time">[${l.time}]</span> ${l.msg}</div>`).join('');
+                el.scrollTop = el.scrollHeight;
+                return latestSignature;
+            }
+        }
+        return lastTimeVar;
+    };
+    lastLogTimeScr = renderLog('log-scr', res.state.logs, lastLogTimeScr);
+    lastLogTimeRen = renderLog('log-ren', res.renamerState.logs, lastLogTimeRen);
+    document.getElementById('stat-scr').innerText = res.state.totalScraped;
+}, 2000);
+
+async function showQr() {
+    const m = document.getElementById('modal'); m.style.display = 'flex';
+    const res = await request('115/qr'); if(!res.success) return;
+    const { uid, time, sign, qr_url } = res.data;
+    document.getElementById('qr-img').innerHTML = `<img src="${qr_url}" width="200">`;
+    if(qrTimer) clearInterval(qrTimer);
+    qrTimer = setInterval(async () => {
+        const chk = await request(`115/check?uid=${uid}&time=${time}&sign=${sign}`);
+        const txt = document.getElementById('qr-txt');
+        if(chk.success) { txt.innerText = "✅ 成功! 刷新..."; txt.style.color = "#0f0"; clearInterval(qrTimer); setTimeout(() => { m.style.display='none'; location.reload(); }, 1000); }
+        else if (chk.status === 1) { txt.innerText = "📱 已扫码"; txt.style.color = "#fb5"; }
+    }, 1500);
+}
+EOF
+
+# 3. 更新后端 API (api.js) - 接收 source 参数
+echo "📝 更新 app/routes/api.js..."
+cat > /app/app/routes/api.js << 'EOF'
+const express = require('express');
+const axios = require('axios');
+const router = express.Router();
+const fs = require('fs');
+const { exec } = require('child_process');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+const { Parser } = require('json2csv');
+const Scraper = require('../modules/scraper');
+const Renamer = require('../modules/renamer');
+const Login115 = require('../modules/login_115');
+const ResourceMgr = require('../modules/resource_mgr');
+const AUTH_PASSWORD = process.env.AUTH_PASSWORD || "admin888";
+
+router.get('/check-auth', (req, res) => {
+    const auth = req.headers['authorization'];
+    res.json({ authenticated: auth === AUTH_PASSWORD });
+});
+router.post('/login', (req, res) => {
+    if (req.body.password === AUTH_PASSWORD) res.json({ success: true });
+    else res.json({ success: false, msg: "密码错误" });
+});
+router.post('/config', (req, res) => {
+    global.CONFIG = { ...global.CONFIG, ...req.body };
+    global.saveConfig();
+    res.json({ success: true });
+});
+router.get('/status', (req, res) => {
+    res.json({ config: global.CONFIG, state: Scraper.getState(), renamerState: Renamer.getState(), version: global.CURRENT_VERSION });
+});
+router.get('/115/qr', async (req, res) => {
+    try {
+        const data = await Login115.getQrCode();
+        res.json({ success: true, data });
+    } catch (e) { res.json({ success: false, msg: e.message }); }
+});
+router.get('/115/check', async (req, res) => {
+    const { uid, time, sign } = req.query;
+    const result = await Login115.checkStatus(uid, time, sign);
+    if (result.success && result.cookie) {
+        global.CONFIG.cookie115 = result.cookie;
+        global.saveConfig();
+        res.json({ success: true, msg: "登录成功", cookie: result.cookie });
+    } else { res.json(result); }
+});
+router.post('/start', (req, res) => {
+    const autoDl = req.body.autoDownload === true;
+    const source = req.body.source || 'madou';
+    Scraper.start(req.body.type === 'full' ? 50000 : 100, source, autoDl);
+    res.json({ success: true });
+});
+router.post('/stop', (req, res) => {
+    Scraper.stop();
+    Renamer.stop();
+    res.json({ success: true });
+});
+router.post('/renamer/start', (req, res) => {
+    Renamer.start(parseInt(req.body.pages) || 0, req.body.force === true);
+    res.json({ success: true });
+});
+router.post('/push', async (req, res) => {
+    const magnets = req.body.magnets || [];
+    if (!global.CONFIG.cookie115) return res.json({ success: false, msg: "未登录115" });
+    if (magnets.length === 0) return res.json({ success: false, msg: "未选择任务" });
+    let successCount = 0;
+    try {
+        for (const val of magnets) {
+            const parts = val.split('|');
+            const id = parts[0];
+            const magnet = parts.length > 1 ? parts[1].trim() : parts[0].trim();
+            const postData = `url=${encodeURIComponent(magnet)}`;
+            const result = await axios.post('https://115.com/web/lixian/?ct=lixian&ac=add_task_url', postData, {
+                headers: {
+                    'Cookie': global.CONFIG.cookie115,
+                    'User-Agent': global.CONFIG.userAgent,
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                }
+            });
+            if (result.data && result.data.state) {
+                successCount++;
+                await ResourceMgr.markAsPushed(id);
+            }
+            await new Promise(r => setTimeout(r, 500));
+        }
+        res.json({ success: true, count: successCount });
+    } catch (e) { res.json({ success: false, msg: e.message }); }
+});
+
+router.get('/data', async (req, res) => {
+    const filters = {
+        pushed: req.query.pushed || '',
+        renamed: req.query.renamed || ''
+    };
+    const result = await ResourceMgr.getList(parseInt(req.query.page) || 1, 100, filters);
+    res.json(result);
+});
+
+router.get('/export', async (req, res) => {
+    try {
+        const type = req.query.type || 'page';
+        let data = [];
+        if (type === 'all') data = await ResourceMgr.getAllForExport();
+        else {
+            const result = await ResourceMgr.getList(parseInt(req.query.page) || 1, 100);
+            data = result.data;
+        }
+        const parser = new Parser({ fields: ['id', 'title', 'magnets', 'created_at'] });
+        const csv = parser.parse(data);
+        res.header('Content-Type', 'text/csv');
+        res.attachment(`madou_${Date.now()}.csv`);
+        return res.send(csv);
+    } catch (err) { res.status(500).send("Err: " + err.message); }
+});
+
+function compareVersions(v1, v2) {
+    if (!v1 || !v2) return 0;
+    const p1 = v1.split('.').map(Number);
+    const p2 = v2.split('.').map(Number);
+    for (let i = 0; i < Math.max(p1.length, p2.length); i++) {
+        const n1 = p1[i] || 0;
+        const n2 = p2[i] || 0;
+        if (n1 > n2) return 1;
+        if (n1 < n2) return -1;
+    }
+    return 0;
+}
+
+router.post('/system/online-update', async (req, res) => {
+    const updateUrl = global.UPDATE_URL;
+    const options = { timeout: 30000 };
+    if (global.CONFIG.proxy && global.CONFIG.proxy.startsWith('http')) {
+        const agent = new HttpsProxyAgent(global.CONFIG.proxy);
+        options.httpAgent = agent;
+        options.httpsAgent = agent;
+    }
+    const tempScriptPath = '/data/update_temp.sh';
+    const finalScriptPath = '/data/update.sh';
+    try {
+        console.log(`⬇️ 正在检查更新: ${updateUrl}`);
+        const response = await axios({ method: 'get', url: updateUrl, ...options, responseType: 'stream' });
+        const writer = fs.createWriteStream(tempScriptPath);
+        response.data.pipe(writer);
+        writer.on('finish', () => {
+            fs.readFile(tempScriptPath, 'utf8', (err, data) => {
+                if (err) return res.json({ success: false, msg: "无法读取下载的脚本" });
+                const match = data.match(/#\s*VERSION\s*=\s*([0-9\.]+)/);
+                const remoteVersion = match ? match[1] : null;
+                const localVersion = global.CURRENT_VERSION;
+                if (!remoteVersion) return res.json({ success: false, msg: "远程脚本未包含版本号信息" });
+                console.log(`🔍 版本对比: 本地[${localVersion}] vs 云端[${remoteVersion}]`);
+                if (compareVersions(remoteVersion, localVersion) > 0) {
+                    fs.renameSync(tempScriptPath, finalScriptPath);
+                    res.json({ success: true, msg: `发现新版本 V${remoteVersion}，正在升级...` });
+                    setTimeout(() => {
+                        exec(`chmod +x ${finalScriptPath} && sh ${finalScriptPath}`, (error, stdout, stderr) => {
+                            if (error) console.error(`❌ 升级失败: ${error.message}`);
+                            else {
+                                console.log(`✅ 升级日志:\n${stdout}`);
+                                fs.renameSync(finalScriptPath, finalScriptPath + '.bak');
+                                console.log("🔄 重启容器...");
+                                process.exit(0);
+                            }
+                        });
+                    }, 1000);
+                } else {
+                    fs.unlinkSync(tempScriptPath);
+                    res.json({ success: false, msg: `当前已是最新版本 (V${localVersion})` });
+                }
+            });
+        });
+        writer.on('error', (err) => { res.json({ success: false, msg: "文件写入失败" }); });
+    } catch (e) { res.json({ success: false, msg: "连接失败: " + e.message }); }
+});
+module.exports = router;
+EOF
+
+# 4. 更新爬虫模块 (scraper.js) - 支持多源选择
+echo "📝 更新 app/modules/scraper.js..."
+cat > /app/app/modules/scraper.js << 'EOF'
+const axios = require('axios');
+const cheerio = require('cheerio');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+const ResourceMgr = require('./resource_mgr');
+
+let STATE = { isRunning: false, stopSignal: false, logs: [], totalScraped: 0 };
+
+function log(msg, type='info') {
+    STATE.logs.push({ time: new Date().toLocaleTimeString(), msg, type });
+    if (STATE.logs.length > 200) STATE.logs.shift();
+    console.log(`[Scraper] ${msg}`);
+}
+
+function getRequest(referer) {
+    const options = {
+        headers: { 
+            'User-Agent': global.CONFIG.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36', 
+            'Referer': referer 
+        },
+        timeout: 20000
+    };
+    if (global.CONFIG.proxy && global.CONFIG.proxy.startsWith('http')) {
+        const agent = new HttpsProxyAgent(global.CONFIG.proxy);
+        options.httpAgent = agent;
+        options.httpsAgent = agent;
+    }
+    return axios.create(options);
+}
+
+async function pushTo115(magnet) {
+    if (!global.CONFIG.cookie115) return false;
+    try {
+        const postData = `url=${encodeURIComponent(magnet)}`;
+        const res = await axios.post('https://115.com/web/lixian/?ct=lixian&ac=add_task_url', postData, {
+            headers: {
+                'Cookie': global.CONFIG.cookie115,
+                'User-Agent': global.CONFIG.userAgent,
+                'Content-Type': 'application/x-www-form-urlencoded'
+            }
+        });
+        return res.data && res.data.state;
+    } catch (e) { return false; }
+}
+
+async function scrapeMadouQu(request, limitPages, autoDownload) {
+    let page = 1;
+    let url = "https://madouqu.com/";
+    log(`==== 正在启动 MadouQu 采集 (Max: ${limitPages}页) ====`, 'info');
+    while (page <= limitPages && !STATE.stopSignal) {
+        log(`[Madou] 正在抓取第 ${page} 页: ${url}`, 'info');
+        try {
+            const res = await request.get(url);
+            const $ = cheerio.load(res.data);
+            const posts = $('article h2.entry-title a, h2.entry-title a');
+            if (posts.length === 0) { log(`[Madou] ⚠️ 第 ${page} 页未找到文章`, 'warn'); break; }
+            log(`[Madou] 本页发现 ${posts.length} 个资源...`);
+            for (let i = 0; i < posts.length; i++) {
+                if (STATE.stopSignal) break;
+                const el = posts[i];
+                const link = $(el).attr('href');
+                const title = $(el).text().trim();
+                try {
+                    const detail = await request.get(link);
+                    const match = detail.data.match(/magnet:\?xt=urn:btih:[a-zA-Z0-9]{32,40}/gi);
+                    if (match) {
+                        const magnets = Array.from(new Set(match)).join(' | ');
+                        const saved = await ResourceMgr.save(title, link, magnets);
+                        if(saved) {
+                            STATE.totalScraped++;
+                            let extraMsg = "";
+                            if (autoDownload && match[0]) {
+                                const pushRes = await pushTo115(match[0]);
+                                if (pushRes) { extraMsg = " | 📥 已推115"; await ResourceMgr.markAsPushedByLink(link); }
+                                else { extraMsg = " | ⚠️ 推送失败"; }
+                            }
+                            log(`✅ [入库${extraMsg}] ${title.substring(0, 15)}...`, 'success');
+                        }
+                    } else { log(`❌ [无磁力] ${title.substring(0, 15)}...`, 'warn'); }
+                } catch (e) { log(`❌ [Madou失败] ${title.substring(0, 10)}... : ${e.message}`, 'error'); }
+                await new Promise(r => setTimeout(r, Math.floor(Math.random() * 1000) + 1000));
+            }
+            const next = $('a.next').attr('href');
+            if (next) { url = next; page++; await new Promise(r => setTimeout(r, 2000)); } 
+            else { log("[Madou] 🚫 没有下一页了", 'success'); break; }
+        } catch (pageErr) { log(`❌ [Madou] 获取第 ${page} 页失败: ${pageErr.message}`, 'error'); await new Promise(r => setTimeout(r, 5000)); }
+    }
+}
+
+async function scrapeXChina(request, limitPages, autoDownload) {
+    let page = 1;
+    let url = "https://xchina.co/videos.html";
+    const domain = "https://xchina.co";
+    log(`==== 正在启动 XChina 采集 (Max: ${limitPages}页) ====`, 'info');
+    while (page <= limitPages && !STATE.stopSignal) {
+        log(`[XChina] 正在抓取第 ${page} 页: ${url}`, 'info');
+        try {
+            const res = await request.get(url);
+            const $ = cheerio.load(res.data);
+            const posts = $('.list.video-index .item.video');
+            if (posts.length === 0) { log(`[XChina] ⚠️ 第 ${page} 页未找到视频`, 'warn'); break; }
+            log(`[XChina] 本页发现 ${posts.length} 个资源...`);
+            for (let i = 0; i < posts.length; i++) {
+                if (STATE.stopSignal) break;
+                const el = posts[i];
+                const titleTag = $(el).find('.text .title a');
+                let title = titleTag.text().trim();
+                let detailLink = titleTag.attr('href');
+                if (!title || !detailLink) continue;
+                if (detailLink.startsWith('/')) detailLink = domain + detailLink;
+                try {
+                    const detailRes = await request.get(detailLink);
+                    const $d = cheerio.load(detailRes.data);
+                    let downloadPageLink = $d('a[href*="/download/id-"]').attr('href');
+                    if (downloadPageLink) {
+                        if (downloadPageLink.startsWith('/')) downloadPageLink = domain + downloadPageLink;
+                        const downloadRes = await request.get(downloadPageLink);
+                        const $dl = cheerio.load(downloadRes.data);
+                        const magnet = $dl('a.btn.magnet[href^="magnet:"]').attr('href');
+                        if (magnet) {
+                            const saved = await ResourceMgr.save(title, detailLink, magnet);
+                            if(saved) {
+                                STATE.totalScraped++;
+                                let extraMsg = "";
+                                if (autoDownload) {
+                                    const pushRes = await pushTo115(magnet);
+                                    if (pushRes) { extraMsg = " | 📥 已推115"; await ResourceMgr.markAsPushedByLink(detailLink); }
+                                    else { extraMsg = " | ⚠️ 推送失败"; }
+                                }
+                                log(`✅ [入库${extraMsg}] ${title.substring(0, 15)}...`, 'success');
+                            }
+                        } else { log(`❌ [XChina无磁力] ${title.substring(0, 15)}...`, 'warn'); }
+                    } else { log(`❌ [XChina无下载页] ${title.substring(0, 15)}...`, 'warn'); }
+                } catch (e) { log(`❌ [XChina失败] ${title.substring(0, 10)}... : ${e.message}`, 'error'); }
+                await new Promise(r => setTimeout(r, Math.floor(Math.random() * 1500) + 1000));
+            }
+            const nextHref = $('.pagination a:contains("下一页"), .pagination a:contains("Next"), a.next').attr('href');
+            if (nextHref) {
+                url = nextHref.startsWith('/') ? domain + nextHref : nextHref;
+                page++;
+                await new Promise(r => setTimeout(r, 2000));
+            } else { log("[XChina] 🚫 当前页未发现下一页链接，停止采集", 'success'); break; }
+        } catch (pageErr) { log(`❌ [XChina] 获取第 ${page} 页失败: ${pageErr.message}`, 'error'); await new Promise(r => setTimeout(r, 5000)); break; }
+    }
+}
+
+const Scraper = {
+    getState: () => STATE,
+    stop: () => { STATE.stopSignal = true; },
+    clearLogs: () => { STATE.logs = []; },
+    start: async (limitPages = 5, source = "madou", autoDownload = false) => {
+        if (STATE.isRunning) return;
+        STATE.isRunning = true;
+        STATE.stopSignal = false;
+        STATE.totalScraped = 0;
+        
+        log(`🚀 任务启动 | 源: ${source} | 自动下载: ${autoDownload ? '✅开启' : '❌关闭'}`, 'success');
+
+        if (source === 'madou') {
+            const req = getRequest('https://madouqu.com/');
+            await scrapeMadouQu(req, limitPages, autoDownload);
+        } else if (source === 'xchina') {
+            const req = getRequest('https://xchina.co/');
+            await scrapeXChina(req, limitPages, autoDownload);
+        } else {
+            log(`❌ 未知的采集源: ${source}`, 'error');
+        }
+
+        STATE.isRunning = false;
+        log(`🏁 任务结束，本次共入库 ${STATE.totalScraped} 条`, 'warn');
+    }
+};
+module.exports = Scraper;
+EOF
+
+# 5. 更新版本号 (package.json)
+echo "📝 更新 app/package.json..."
+sed -i 's/"version": ".*"/"version": "13.7.0"/' /app/app/package.json
+
+echo "✅ 升级完成，系统将自动重启..."
