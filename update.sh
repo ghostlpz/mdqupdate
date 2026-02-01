@@ -1,11 +1,15 @@
-
 #!/bin/bash
-# VERSION = 13.9.0
+# VERSION = 13.9.1
 
-echo "🚀 正在部署 V13.9.0 混合动力版 (智能 Cloudflare 穿透)..."
-echo "⏳ 第一步：安装 Chromium 内核 (耗时较长，请耐心等待)..."
+echo "🚑 检测到 Chromium 缺失，开始执行 V13.9.1 环境修复..."
 
-# 1. 安装 Chromium (用于解决 403)
+# 1. 切换为阿里云镜像源 (解决国内下载失败的问题)
+echo "⚡ 正在切换 Alpine 软件源为阿里云..."
+sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
+
+# 2. 更新索引并安装 Chromium
+echo "⏳ 正在重装 Chromium (请耐心等待下载)..."
+apk update
 apk add --no-cache \
     chromium \
     nss \
@@ -15,38 +19,24 @@ apk add --no-cache \
     ttf-freefont \
     libstdc++
 
-echo "✅ Chromium 安装完成！"
+# 3. 验证安装
+if [ -f "/usr/bin/chromium-browser" ]; then
+    echo "✅ Chromium 安装成功！路径: /usr/bin/chromium-browser"
+elif [ -f "/usr/bin/chromium" ]; then
+    echo "✅ Chromium 安装成功！路径: /usr/bin/chromium"
+else
+    echo "❌ 严重警告: Chromium 依然未找到！请检查网络连接。"
+fi
 
-# 2. 更新 package.json (增加 puppeteer-core)
-echo "📝 更新 /app/package.json..."
-cat > /app/package.json << 'EOF'
-{
-  "name": "madou-omni-system",
-  "version": "13.9.0",
-  "main": "app.js",
-  "dependencies": {
-    "axios": "^1.6.0",
-    "cheerio": "^1.0.0-rc.12",
-    "cookie-parser": "^1.4.6",
-    "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "https-proxy-agent": "^7.0.2",
-    "mysql2": "^3.6.5",
-    "node-schedule": "^2.1.1",
-    "json2csv": "^6.0.0-alpha.2",
-    "puppeteer-core": "^21.0.0"
-  }
-}
-EOF
-
-# 3. 更新爬虫模块 (scraper.js) - 实现“打不过就摇人”的逻辑
-echo "📝 更新 /app/modules/scraper.js..."
+# 4. 更新 scraper.js (增加路径自动探测功能)
+echo "📝 更新 /app/modules/scraper.js (增加路径容错)..."
 cat > /app/modules/scraper.js << 'EOF'
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const puppeteer = require('puppeteer-core');
 const ResourceMgr = require('./resource_mgr');
+const fs = require('fs');
 
 let STATE = { isRunning: false, stopSignal: false, logs: [], totalScraped: 0 };
 
@@ -56,9 +46,28 @@ function log(msg, type='info') {
     console.log(`[Scraper] ${msg}`);
 }
 
-// 核心函数：启动浏览器获取“通行证”
+// 自动寻找 Chromium 可执行文件
+function findChromium() {
+    const paths = [
+        '/usr/bin/chromium-browser', // Alpine 默认
+        '/usr/bin/chromium',         // 备用
+        '/usr/bin/google-chrome-stable'
+    ];
+    for (const p of paths) {
+        if (fs.existsSync(p)) return p;
+    }
+    return null;
+}
+
 async function solveCloudflare(targetUrl) {
-    log(`🛡️ 触发 Cloudflare 拦截，启动浏览器尝试破解...`, 'warn');
+    log(`🛡️ 触发 Cloudflare 拦截，准备启动浏览器...`, 'warn');
+    
+    const execPath = findChromium();
+    if (!execPath) {
+        log(`❌ 致命错误: 未找到 Chromium 浏览器！请检查 Docker 环境。`, 'error');
+        return null;
+    }
+
     let browser = null;
     try {
         const launchArgs = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'];
@@ -68,32 +77,24 @@ async function solveCloudflare(targetUrl) {
         }
 
         browser = await puppeteer.launch({
-            executablePath: '/usr/bin/chromium-browser',
+            executablePath: execPath, // 使用自动探测到的路径
             headless: 'new',
             args: launchArgs
         });
 
         const page = await browser.newPage();
-        
-        // 伪装成普通 Mac Chrome
         const fakeUA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
         await page.setUserAgent(fakeUA);
 
         log(`🛡️ 浏览器正在访问目标...`);
-        // 访问页面，等待 CF 盾消失
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        
-        // 等待 5-10 秒确保 JS 执行完毕
-        await new Promise(r => setTimeout(r, 8000));
+        await new Promise(r => setTimeout(r, 8000)); // 等待盾牌消失
 
-        // 提取凭证
         const cookies = await page.cookies();
         const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
         const userAgent = await page.evaluate(() => navigator.userAgent);
 
         log(`✅ 成功获取通行证!`, 'success');
-        // log(`🔑 Cookie: ${cookieStr.substring(0, 20)}...`);
-        
         return { cookie: cookieStr, ua: userAgent };
 
     } catch (e) {
@@ -105,7 +106,6 @@ async function solveCloudflare(targetUrl) {
 }
 
 function getRequest(referer) {
-    // 动态获取 Config 中的 UA 和 Cookie
     const userAgent = (global.CONFIG.userAgent && global.CONFIG.userAgent.trim() !== '') 
         ? global.CONFIG.userAgent.trim() 
         : 'Mozilla/5.0';
@@ -124,7 +124,6 @@ function getRequest(referer) {
     const options = {
         headers: headers,
         timeout: 20000,
-        // 允许 403/503 通过，以便在逻辑层处理
         validateStatus: status => status >= 200 && status < 600
     };
 
@@ -152,7 +151,6 @@ async function pushTo115(magnet) {
 }
 
 async function scrapeMadouQu(limitPages, autoDownload) {
-    // MadouQu 逻辑不变，省略具体实现以节省篇幅，实际使用时请保持原有逻辑
     let page = 1;
     let url = "https://madouqu.com/";
     const request = getRequest();
@@ -193,49 +191,30 @@ async function scrapeXChina(limitPages, autoDownload) {
     const domain = "https://xchina.co";
     
     log(`==== 启动 XChina (混合动力模式) ====`, 'info');
-
-    // 尝试次数
     let retryCount = 0;
 
     while (page <= limitPages && !STATE.stopSignal) {
         log(`[XChina] 正在请求第 ${page} 页: ${url}`, 'info');
-        
-        // 1. 获取当前的 Request 实例 (携带当前的 Cookie)
         let request = getRequest(domain);
 
         try {
             const res = await request.get(url);
 
-            // === 2. 拦截 403/503 错误 ===
             if (res.status === 403 || res.status === 503 || (typeof res.data === 'string' && res.data.includes('challenge-platform'))) {
-                
-                if (retryCount >= 3) {
-                    log(`❌ 连续破解失败，停止任务。`, 'error');
-                    break;
-                }
-
-                // 3. 启动浏览器破解
+                if (retryCount >= 3) { log(`❌ 连续破解失败，停止任务。`, 'error'); break; }
                 const tokens = await solveCloudflare(url);
                 if (tokens) {
-                    // 4. 更新全局配置
                     global.CONFIG.scraperCookie = tokens.cookie;
                     global.CONFIG.userAgent = tokens.ua;
-                    // 保存到文件，防止重启丢失
                     global.saveConfig();
-                    
                     log(`🔄 凭证已更新，正在重试...`, 'info');
                     retryCount++;
-                    // 暂停一下再重试
                     await new Promise(r => setTimeout(r, 2000));
-                    continue; // 重新执行本轮循环
-                } else {
-                    break;
-                }
+                    continue; 
+                } else { break; }
             }
 
-            // 如果成功，重置重试计数
             retryCount = 0;
-
             const $ = cheerio.load(res.data);
             const posts = $('.list.video-index .item.video');
 
@@ -252,16 +231,13 @@ async function scrapeXChina(limitPages, autoDownload) {
                 if (detailLink.startsWith('/')) detailLink = domain + detailLink;
 
                 try {
-                    // 详情页请求
-                    request = getRequest(url); // 刷新头部
+                    request = getRequest(url);
                     const detailRes = await request.get(detailLink);
                     const $d = cheerio.load(detailRes.data);
                     let downloadPageLink = $d('a[href*="/download/id-"]').attr('href');
                     
                     if (downloadPageLink) {
                         if (downloadPageLink.startsWith('/')) downloadPageLink = domain + downloadPageLink;
-                        
-                        // 下载页请求
                         const downloadRes = await request.get(downloadPageLink);
                         const $dl = cheerio.load(downloadRes.data);
                         const magnet = $dl('a.btn.magnet[href^="magnet:"]').attr('href');
@@ -280,7 +256,7 @@ async function scrapeXChina(limitPages, autoDownload) {
                         }
                     }
                 } catch (e) { log(`❌ 解析失败: ${e.message}`, 'error'); }
-                await new Promise(r => setTimeout(r, 1000)); // 礼貌延迟
+                await new Promise(r => setTimeout(r, 1000)); 
             }
 
             const nextHref = $('.pagination a:contains("下一页"), .pagination a:contains("Next"), a.next').attr('href');
@@ -322,8 +298,8 @@ const Scraper = {
 module.exports = Scraper;
 EOF
 
-# 4. 更新版本号
+# 5. 更新版本号
 echo "📝 更新 /app/package.json..."
-sed -i 's/"version": ".*"/"version": "13.9.0"/' /app/package.json
+sed -i 's/"version": ".*"/"version": "13.9.1"/' /app/package.json
 
-echo "✅ 升级完成 (V13.9.0 混合动力版)，系统将自动重启..."
+echo "✅ 修复完成，系统将重启并生效..."
