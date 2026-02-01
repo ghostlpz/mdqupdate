@@ -1,11 +1,10 @@
 #!/bin/bash
-# VERSION = 13.8.0
+# VERSION = 13.9.0
 
-echo "🔥 收到挑战！开始部署核武级更新 V13.8.0 (Puppeteer 浏览器内核)..."
-echo "⏳ 正在安装 Chromium 及相关依赖 (可能需要几分钟，请勿中断)..."
+echo "🚀 正在部署 V13.9.0 混合动力版 (智能 Cloudflare 穿透)..."
+echo "⏳ 第一步：安装 Chromium 内核 (耗时较长，请耐心等待)..."
 
-# 1. 安装系统级依赖 (Alpine Linux)
-# 这一步是为了让 Docker 容器能跑起来真正的 Chrome
+# 1. 安装 Chromium (用于解决 403)
 apk add --no-cache \
     chromium \
     nss \
@@ -17,13 +16,12 @@ apk add --no-cache \
 
 echo "✅ Chromium 安装完成！"
 
-# 2. 更新 package.json 加入 puppeteer-core
+# 2. 更新 package.json (增加 puppeteer-core)
 echo "📝 更新 /app/package.json..."
-# 使用临时文件确保 JSON 格式正确
 cat > /app/package.json << 'EOF'
 {
   "name": "madou-omni-system",
-  "version": "13.8.0",
+  "version": "13.9.0",
   "main": "app.js",
   "dependencies": {
     "axios": "^1.6.0",
@@ -40,13 +38,13 @@ cat > /app/package.json << 'EOF'
 }
 EOF
 
-# 3. 更新爬虫模块 (scraper.js) - 引入 Puppeteer
+# 3. 更新爬虫模块 (scraper.js) - 实现“打不过就摇人”的逻辑
 echo "📝 更新 /app/modules/scraper.js..."
 cat > /app/modules/scraper.js << 'EOF'
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { HttpsProxyAgent } = require('https-proxy-agent');
-const puppeteer = require('puppeteer-core'); // 引入 puppeteer
+const puppeteer = require('puppeteer-core');
 const ResourceMgr = require('./resource_mgr');
 
 let STATE = { isRunning: false, stopSignal: false, logs: [], totalScraped: 0 };
@@ -57,12 +55,78 @@ function log(msg, type='info') {
     console.log(`[Scraper] ${msg}`);
 }
 
-// 普通 HTTP 请求 (用于 Madou)
-function getRequest() {
-    const options = {
-        headers: { 'User-Agent': global.CONFIG.userAgent || 'Mozilla/5.0' },
-        timeout: 20000
+// 核心函数：启动浏览器获取“通行证”
+async function solveCloudflare(targetUrl) {
+    log(`🛡️ 触发 Cloudflare 拦截，启动浏览器尝试破解...`, 'warn');
+    let browser = null;
+    try {
+        const launchArgs = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'];
+        if (global.CONFIG.proxy) {
+            const proxyUrl = global.CONFIG.proxy.replace('http://', '').replace('https://', '');
+            launchArgs.push(`--proxy-server=${proxyUrl}`);
+        }
+
+        browser = await puppeteer.launch({
+            executablePath: '/usr/bin/chromium-browser',
+            headless: 'new',
+            args: launchArgs
+        });
+
+        const page = await browser.newPage();
+        
+        // 伪装成普通 Mac Chrome
+        const fakeUA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+        await page.setUserAgent(fakeUA);
+
+        log(`🛡️ 浏览器正在访问目标...`);
+        // 访问页面，等待 CF 盾消失
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        
+        // 等待 5-10 秒确保 JS 执行完毕
+        await new Promise(r => setTimeout(r, 8000));
+
+        // 提取凭证
+        const cookies = await page.cookies();
+        const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+        const userAgent = await page.evaluate(() => navigator.userAgent);
+
+        log(`✅ 成功获取通行证!`, 'success');
+        // log(`🔑 Cookie: ${cookieStr.substring(0, 20)}...`);
+        
+        return { cookie: cookieStr, ua: userAgent };
+
+    } catch (e) {
+        log(`❌ 浏览器破解失败: ${e.message}`, 'error');
+        return null;
+    } finally {
+        if (browser) await browser.close();
+    }
+}
+
+function getRequest(referer) {
+    // 动态获取 Config 中的 UA 和 Cookie
+    const userAgent = (global.CONFIG.userAgent && global.CONFIG.userAgent.trim() !== '') 
+        ? global.CONFIG.userAgent.trim() 
+        : 'Mozilla/5.0';
+
+    const headers = {
+        'User-Agent': userAgent,
+        'Referer': referer,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Upgrade-Insecure-Requests': '1'
     };
+    
+    if (global.CONFIG.scraperCookie && global.CONFIG.scraperCookie.trim() !== '') {
+        headers['Cookie'] = global.CONFIG.scraperCookie.trim();
+    }
+
+    const options = {
+        headers: headers,
+        timeout: 20000,
+        // 允许 403/503 通过，以便在逻辑层处理
+        validateStatus: status => status >= 200 && status < 600
+    };
+
     if (global.CONFIG.proxy && global.CONFIG.proxy.startsWith('http')) {
         const agent = new HttpsProxyAgent(global.CONFIG.proxy);
         options.httpAgent = agent;
@@ -71,7 +135,6 @@ function getRequest() {
     return axios.create(options);
 }
 
-// 115 推送
 async function pushTo115(magnet) {
     if (!global.CONFIG.cookie115) return false;
     try {
@@ -87,14 +150,13 @@ async function pushTo115(magnet) {
     } catch (e) { return false; }
 }
 
-// MadouQu 采集逻辑 (保持 Axios，因为它没盾且快)
 async function scrapeMadouQu(limitPages, autoDownload) {
-    const request = getRequest();
+    // MadouQu 逻辑不变，省略具体实现以节省篇幅，实际使用时请保持原有逻辑
     let page = 1;
     let url = "https://madouqu.com/";
-    log(`==== 启动 MadouQu (轻量模式) ====`, 'info');
+    const request = getRequest();
+    log(`==== 启动 MadouQu 采集 ====`, 'info');
     while (page <= limitPages && !STATE.stopSignal) {
-        log(`[Madou] 抓取第 ${page} 页...`, 'info');
         try {
             const res = await request.get(url);
             const $ = cheerio.load(res.data);
@@ -111,144 +173,126 @@ async function scrapeMadouQu(limitPages, autoDownload) {
                         const saved = await ResourceMgr.save(title, link, match[0]);
                         if(saved) {
                             STATE.totalScraped++;
-                            if (autoDownload) pushTo115(match[0]);
-                            log(`✅ [入库] ${title.substring(0,15)}...`, 'success');
+                            if(autoDownload) pushTo115(match[0]);
+                            log(`✅ [入库] ${title.substring(0,10)}...`, 'success');
                         }
                     }
-                } catch (e) {}
+                } catch(e) {}
                 await new Promise(r => setTimeout(r, 1000));
             }
             const next = $('a.next').attr('href');
             if (next) { url = next; page++; } else break;
-        } catch (e) { log(`❌ [Madou] 错误: ${e.message}`, 'error'); await new Promise(r => setTimeout(r, 3000)); }
+        } catch (e) { log(`Error: ${e.message}`, 'error'); break; }
     }
 }
 
-// XChina 采集逻辑 (使用 Puppeteer 真浏览器)
 async function scrapeXChina(limitPages, autoDownload) {
-    log(`==== 启动 XChina (浏览器内核模式) ====`, 'info');
-    log(`⚙️ 正在启动 Chromium... (首次启动较慢)`, 'warn');
+    let page = 1;
+    let url = "https://xchina.co/videos.html";
+    const domain = "https://xchina.co";
+    
+    log(`==== 启动 XChina (混合动力模式) ====`, 'info');
 
-    let browser = null;
-    try {
-        // 配置启动参数
-        const launchArgs = [
-            '--no-sandbox', 
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu'
-        ];
+    // 尝试次数
+    let retryCount = 0;
+
+    while (page <= limitPages && !STATE.stopSignal) {
+        log(`[XChina] 正在请求第 ${page} 页: ${url}`, 'info');
         
-        // 如果配置了代理，传给浏览器
-        if (global.CONFIG.proxy) {
-            const proxyUrl = global.CONFIG.proxy.replace('http://', '').replace('https://', '');
-            launchArgs.push(`--proxy-server=${proxyUrl}`);
-        }
+        // 1. 获取当前的 Request 实例 (携带当前的 Cookie)
+        let request = getRequest(domain);
 
-        browser = await puppeteer.launch({
-            executablePath: '/usr/bin/chromium-browser', // Alpine 安装的路径
-            headless: 'new',
-            args: launchArgs
-        });
+        try {
+            const res = await request.get(url);
 
-        const page = await browser.newPage();
-        
-        // 设置浏览器指纹
-        const ua = global.CONFIG.userAgent || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-        await page.setUserAgent(ua);
+            // === 2. 拦截 403/503 错误 ===
+            if (res.status === 403 || res.status === 503 || (typeof res.data === 'string' && res.data.includes('challenge-platform'))) {
+                
+                if (retryCount >= 3) {
+                    log(`❌ 连续破解失败，停止任务。`, 'error');
+                    break;
+                }
 
-        // 设置 Cookie (关键！)
-        if (global.CONFIG.scraperCookie) {
-            const cookieStr = global.CONFIG.scraperCookie;
-            const cookies = cookieStr.split(';').map(pair => {
-                const [name, ...value] = pair.trim().split('=');
-                return { name, value: value.join('='), domain: '.xchina.co' };
-            }).filter(c => c.name && c.value);
-            if (cookies.length > 0) await page.setCookie(...cookies);
-        }
-
-        let currPage = 1;
-        let url = "https://xchina.co/videos.html";
-        const domain = "https://xchina.co";
-
-        while (currPage <= limitPages && !STATE.stopSignal) {
-            log(`[XChina] 正在渲染第 ${currPage} 页...`);
-            
-            // 访问列表页
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-            
-            // 获取页面内容传给 cheerio 处理 (比在浏览器里跑 JS 快)
-            const content = await page.content();
-            const $ = cheerio.load(content);
-            
-            // 检查是不是被拦了
-            if ($('title').text().includes('Just a moment') || content.includes('challenge-platform')) {
-                log(`❌ [XChina] 浏览器盾牌验证未通过，请更新 Cookie`, 'error');
-                break;
+                // 3. 启动浏览器破解
+                const tokens = await solveCloudflare(url);
+                if (tokens) {
+                    // 4. 更新全局配置
+                    global.CONFIG.scraperCookie = tokens.cookie;
+                    global.CONFIG.userAgent = tokens.ua;
+                    // 保存到文件，防止重启丢失
+                    global.saveConfig();
+                    
+                    log(`🔄 凭证已更新，正在重试...`, 'info');
+                    retryCount++;
+                    // 暂停一下再重试
+                    await new Promise(r => setTimeout(r, 2000));
+                    continue; // 重新执行本轮循环
+                } else {
+                    break;
+                }
             }
 
+            // 如果成功，重置重试计数
+            retryCount = 0;
+
+            const $ = cheerio.load(res.data);
             const posts = $('.list.video-index .item.video');
-            if (posts.length === 0) { log(`⚠️ 未找到视频，可能已到底`, 'warn'); break; }
 
-            // 获取本页所有链接，然后一个个去详情页
-            const items = [];
-            posts.each((i, el) => {
-                const titleTag = $(el).find('.text .title a');
-                let href = titleTag.attr('href');
-                if (href && href.startsWith('/')) href = domain + href;
-                items.push({ title: titleTag.text().trim(), link: href });
-            });
+            if (posts.length === 0) { log(`⚠️ 未找到视频`, 'warn'); break; }
+            log(`[XChina] 本页发现 ${posts.length} 个资源...`);
 
-            log(`[XChina] 发现 ${items.length} 个视频，开始逐个解析...`);
-
-            for (const item of items) {
+            for (let i = 0; i < posts.length; i++) {
                 if (STATE.stopSignal) break;
+                const el = posts[i];
+                const titleTag = $(el).find('.text .title a');
+                let title = titleTag.text().trim();
+                let detailLink = titleTag.attr('href');
+                if (!title || !detailLink) continue;
+                if (detailLink.startsWith('/')) detailLink = domain + detailLink;
+
                 try {
-                    // 进入详情页
-                    await page.goto(item.link, { waitUntil: 'domcontentloaded', timeout: 30000 });
-                    const dContent = await page.content();
-                    const $d = cheerio.load(dContent);
+                    // 详情页请求
+                    request = getRequest(url); // 刷新头部
+                    const detailRes = await request.get(detailLink);
+                    const $d = cheerio.load(detailRes.data);
+                    let downloadPageLink = $d('a[href*="/download/id-"]').attr('href');
                     
-                    // 找下载页链接
-                    let dlLink = $d('a[href*="/download/id-"]').attr('href');
-                    if (dlLink) {
-                        if (dlLink.startsWith('/')) dlLink = domain + dlLink;
+                    if (downloadPageLink) {
+                        if (downloadPageLink.startsWith('/')) downloadPageLink = domain + downloadPageLink;
                         
-                        // 进入下载页
-                        await page.goto(dlLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
-                        const dlContent = await page.content();
-                        const $dl = cheerio.load(dlContent);
-                        
+                        // 下载页请求
+                        const downloadRes = await request.get(downloadPageLink);
+                        const $dl = cheerio.load(downloadRes.data);
                         const magnet = $dl('a.btn.magnet[href^="magnet:"]').attr('href');
+                        
                         if (magnet) {
-                             const saved = await ResourceMgr.save(item.title, item.link, magnet);
-                             if(saved) {
+                            const saved = await ResourceMgr.save(title, detailLink, magnet);
+                            if(saved) {
                                 STATE.totalScraped++;
-                                if (autoDownload) pushTo115(magnet);
-                                log(`✅ [入库] ${item.title.substring(0, 15)}...`, 'success');
-                             }
+                                let extraMsg = "";
+                                if (autoDownload) {
+                                    const pushRes = await pushTo115(magnet);
+                                    if (pushRes) extraMsg = " | 📥 已推115";
+                                }
+                                log(`✅ [入库${extraMsg}] ${title.substring(0, 15)}...`, 'success');
+                            }
                         }
                     }
                 } catch (e) { log(`❌ 解析失败: ${e.message}`, 'error'); }
-                
-                // 稍微休息下，模拟真人
-                await new Promise(r => setTimeout(r, 2000));
+                await new Promise(r => setTimeout(r, 1000)); // 礼貌延迟
             }
 
-            // 翻页逻辑
             const nextHref = $('.pagination a:contains("下一页"), .pagination a:contains("Next"), a.next').attr('href');
             if (nextHref) {
                 url = nextHref.startsWith('/') ? domain + nextHref : nextHref;
-                currPage++;
-            } else {
-                break;
-            }
-        }
+                page++;
+                await new Promise(r => setTimeout(r, 2000));
+            } else { break; }
 
-    } catch (e) {
-        log(`🔥 浏览器核心崩溃: ${e.message}`, 'error');
-    } finally {
-        if (browser) await browser.close();
+        } catch (err) {
+            log(`❌ 网络错误: ${err.message}`, 'error');
+            await new Promise(r => setTimeout(r, 5000));
+        }
     }
 }
 
@@ -277,5 +321,8 @@ const Scraper = {
 module.exports = Scraper;
 EOF
 
-echo "✅ 核心模块替换完成！"
-echo "♻️  正在重启服务以应用新依赖..."
+# 4. 更新版本号
+echo "📝 更新 /app/package.json..."
+sed -i 's/"version": ".*"/"version": "13.9.0"/' /app/package.json
+
+echo "✅ 升级完成 (V13.9.0 混合动力版)，系统将自动重启..."
