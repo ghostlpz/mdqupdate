@@ -1,146 +1,193 @@
 #!/bin/bash
-# VERSION = 13.12.2
+# VERSION = 13.13.0
 
 # ---------------------------------------------------------
 # Madou-Omni 在线升级脚本
-# 版本: V13.12.2
-# 功能: 推送与刮削彻底分离，支持对已有任务手动触发刮削new
+# 版本: V13.13.0
+# 优化: 资源库增加实时日志窗口，Organizer 增加详细日志反馈
 # ---------------------------------------------------------
 
-echo "🚀 [Update] 开始部署独立刮削版 (V13.12.2)..."
+echo "🚀 [Update] 开始部署可视化反馈版 (V13.13.0)..."
 
 # 1. 更新 package.json
-sed -i 's/"version": ".*"/"version": "13.12.2"/' package.json
+sed -i 's/"version": ".*"/"version": "13.13.0"/' package.json
 
-# 2. 升级 resource_mgr.js (增加批量查询)
-echo "📝 [1/3] 升级资源管理器 (支持批量获取)..."
-cat > modules/resource_mgr.js << 'EOF'
-const { pool } = require('./db');
+# 2. 升级 organizer.js (增加日志存储功能)
+echo "📝 [1/3] 升级整理核心 (日志持久化)..."
+cat > modules/organizer.js << 'EOF'
+const Login115 = require('./login_115');
+const ResourceMgr = require('./resource_mgr');
 
-function hexToBase32(hex) {
-    const alphabet = 'abcdefghijklmnopqrstuvwxyz234567';
-    let binary = '';
-    for (let i = 0; i < hex.length; i++) {
-        binary += parseInt(hex[i], 16).toString(2).padStart(4, '0');
-    }
-    let base32 = '';
-    for (let i = 0; i < binary.length; i += 5) {
-        const chunk = binary.substr(i, 5);
-        const index = parseInt(chunk.padEnd(5, '0'), 2);
-        base32 += alphabet[index];
-    }
-    return base32;
+let TASKS = []; 
+let IS_RUNNING = false;
+// 🔥 新增：日志存储数组
+let LOGS = [];
+
+function log(msg, type = 'info') {
+    const time = new Date().toLocaleTimeString();
+    // 控制台打印
+    console.log(`[Organizer] ${msg}`);
+    // 存入内存供前端读取
+    LOGS.push({ time, msg, type });
+    // 保留最近 200 条防止内存溢出
+    if (LOGS.length > 200) LOGS.shift();
 }
 
-const ResourceMgr = {
-    async save(data) {
-        if (arguments.length > 1 && typeof arguments[0] === 'string') {
-            data = {
-                title: arguments[0],
-                link: arguments[1],
-                magnets: arguments[2],
-                code: arguments[3] || null,
-                image: arguments[4] || null
-            };
+const Organizer = {
+    // 暴露日志给 API
+    getState: () => ({ queue: TASKS.length, isRunning: IS_RUNNING, logs: LOGS }),
+
+    addTask: (resource) => {
+        if (!TASKS.find(t => t.id === resource.id)) {
+            TASKS.push(resource);
+            log(`➕ 加入整理队列: ${resource.title}`, 'info');
+            Organizer.run();
         }
-        try {
-            const [result] = await pool.execute(
-                'INSERT IGNORE INTO resources (title, link, magnets, code, image_url, actor, category) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                [
-                    data.title, 
-                    data.link, 
-                    data.magnets, 
-                    data.code || null, 
-                    data.image || null, 
-                    data.actor || null, 
-                    data.category || null
-                ]
-            );
-            return { success: true, newInsert: result.affectedRows > 0 };
-        } catch (err) { 
-            console.error(err);
-            return { success: false, newInsert: false }; 
-        }
-    },
-    
-    // 🔥 新增：根据 IDs 批量获取完整对象 (用于刮削)
-    async getByIds(ids) {
-        if (!ids || ids.length === 0) return [];
-        try {
-            const placeholders = ids.map(() => '?').join(',');
-            const [rows] = await pool.query(
-                `SELECT * FROM resources WHERE id IN (${placeholders})`, 
-                ids
-            );
-            return rows;
-        } catch (err) { return []; }
     },
 
-    async deleteByIds(ids) {
-        if (!ids || ids.length === 0) return { success: false, count: 0 };
+    run: async () => {
+        if (IS_RUNNING || TASKS.length === 0) return;
+        IS_RUNNING = true;
+
+        while (TASKS.length > 0) {
+            const item = TASKS[0]; 
+            try {
+                const success = await Organizer.processItem(item);
+                if (success) {
+                    TASKS.shift(); 
+                } else {
+                    TASKS.shift(); // 失败也移除，避免阻塞
+                }
+            } catch (e) {
+                log(`❌ 异常: ${item.title} - ${e.message}`, 'error');
+                TASKS.shift(); 
+            }
+            await new Promise(r => setTimeout(r, 2000));
+        }
+        IS_RUNNING = false;
+        log(`🏁 整理队列处理完毕`, 'success');
+    },
+
+    processItem: async (item) => {
+        const targetCid = global.CONFIG.targetCid;
+        if (!targetCid) { log("未配置目标目录CID，请去设置页配置", 'error'); return true; }
+
+        // 提取 Hash
+        const magnetMatch = item.magnets.match(/[a-fA-F0-9]{40}/);
+        if (!magnetMatch) { log(`❌ 无法提取Hash: ${item.title}`, 'error'); return true; }
+        const hash = magnetMatch[0];
+
+        log(`🔍 [${TASKS.length}待处理] 正在定位任务: ${item.title.substring(0, 15)}...`);
+
+        // 1. 检查 115 任务状态
+        let folderCid = null;
+        let retryCount = 0;
+        const maxRetries = 10; // 手动触发时，我们减少等待时间 (10次 * 5秒 = 50秒)
+
+        while (retryCount < maxRetries) {
+            const task = await Login115.getTaskByHash(hash);
+            
+            if (task) {
+                if (task.state === 2) {
+                    folderCid = task.file_id || task.cid;
+                    if (folderCid) {
+                        log(`✅ 任务已完成，锁定文件夹CID: ${folderCid}`);
+                        break; 
+                    }
+                } else {
+                    const percent = task.percent || 0;
+                    log(`⏳ 下载中... ${percent}% (等待 5s)`);
+                }
+            } else {
+                // 手动刮削时，经常出现任务早已完成但在任务列表被清除的情况
+                // 所以如果查不到 Hash，立即尝试搜索文件夹名
+                log(`⚠️ 任务列表未找到Hash，切换为文件名搜索模式...`);
+                break; 
+            }
+
+            retryCount++;
+            await new Promise(r => setTimeout(r, 5000)); 
+        }
+
+        // 2. 备用方案：搜名字
+        if (!folderCid) {
+            // 净化标题: 去除括号内容，取前8个字，去除特殊字符
+            const cleanTitle = item.title.replace(/[【\[].*?[\]】]/g, '').replace(/[()（）]/g, ' ').substring(0, 8).trim();
+            log(`🔍 尝试搜索文件夹名: "${cleanTitle}"`);
+            const searchRes = await Login115.searchFile(cleanTitle, 0);
+            if (searchRes.data && searchRes.data.length > 0) {
+                // 优先找文件夹
+                const folder = searchRes.data.find(f => f.fcid);
+                if (folder) {
+                    folderCid = folder.cid;
+                    log(`✅ 通过搜索定位到: ${folder.n}`);
+                }
+            }
+        }
+
+        if (!folderCid) {
+            log(`❌ 未能在115找到对应文件夹，请确认已下载成功`, 'error');
+            return true; 
+        }
+
+        // 3. 执行整理
         try {
-            const placeholders = ids.map(() => '?').join(',');
-            const [result] = await pool.query(
-                `DELETE FROM resources WHERE id IN (${placeholders})`, 
-                ids
-            );
-            return { success: true, count: result.affectedRows };
+            // 清理
+            const fileList = await Login115.getFileList(folderCid);
+            if (fileList.data && fileList.data.length > 0) {
+                const files = fileList.data.filter(f => !f.fcid);
+                if (files.length > 0) {
+                    files.sort((a, b) => b.s - a.s);
+                    const keepFile = files[0];
+                    // 只有当有多个文件时才清理
+                    if (files.length > 1) {
+                        const deleteIds = files.slice(1).map(f => f.fid).join(',');
+                        if (deleteIds) {
+                            await Login115.deleteFiles(deleteIds);
+                            log(`🧹 清理了 ${files.length - 1} 个杂文件 (保留: ${keepFile.n})`);
+                        }
+                    }
+                }
+            }
+
+            // 海报
+            if (item.image_url) {
+                await Login115.addTask(item.image_url, folderCid);
+                log(`🖼️ 已添加海报下载任务`);
+            }
+
+            // 重命名
+            let newFolderName = item.title;
+            if (item.actor && item.actor !== '未知演员') {
+                newFolderName = `${item.actor} - ${item.title}`;
+            }
+            newFolderName = newFolderName.replace(/[\\/:*?"<>|]/g, " ").trim();
+            
+            await Login115.rename(folderCid, newFolderName);
+            log(`✏️ 重命名为: ${newFolderName}`);
+
+            // 移动
+            const moveRes = await Login115.move(folderCid, targetCid);
+            if (moveRes) {
+                log(`🚚 成功归档到目标目录!`, 'success');
+                await ResourceMgr.markAsRenamedByTitle(item.title);
+            } else {
+                log(`❌ 移动失败 (可能目标目录不存在?)`, 'error');
+            }
+
         } catch (err) {
-            return { success: false, error: err.message };
+            log(`⚠️ 整理异常: ${err.message}`, 'warn');
         }
-    },
 
-    async queryByHash(hash) {
-        if (!hash) return null;
-        try {
-            const inputHash = hash.trim().toLowerCase();
-            const [rows] = await pool.query(
-                'SELECT * FROM resources WHERE magnets LIKE ? OR magnets LIKE ? LIMIT 1',
-                [`%${inputHash}%`, `%${inputHash.toUpperCase()}%`]
-            );
-            return rows.length > 0 ? rows[0] : null;
-        } catch (err) { return null; }
-    },
-
-    async markAsPushed(id) { try { await pool.query('UPDATE resources SET is_pushed = 1 WHERE id = ?', [id]); } catch (e) {} },
-    async markAsPushedByLink(link) { try { await pool.query('UPDATE resources SET is_pushed = 1 WHERE link = ?', [link]); } catch (e) {} },
-    async markAsRenamedByTitle(title) { try { await pool.query('UPDATE resources SET is_renamed = 1 WHERE title = ?', [title]); } catch (e) {} },
-
-    async getList(page, limit, filters = {}) {
-        try {
-            const offset = (page - 1) * limit;
-            let whereClause = "";
-            const conditions = [];
-            if (filters.pushed === '1') conditions.push("is_pushed = 1");
-            if (filters.pushed === '0') conditions.push("is_pushed = 0");
-            if (filters.renamed === '1') conditions.push("is_renamed = 1");
-            if (filters.renamed === '0') conditions.push("is_renamed = 0");
-            if (conditions.length > 0) whereClause = " WHERE " + conditions.join(" AND ");
-
-            const countSql = `SELECT COUNT(*) as total FROM resources${whereClause}`;
-            const [countRows] = await pool.query(countSql);
-            const total = countRows[0].total;
-
-            const dataSql = `SELECT * FROM resources${whereClause} ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}`;
-            const [rows] = await pool.query(dataSql);
-            return { total, data: rows };
-        } catch (err) {
-            return { total: 0, data: [], error: err.message };
-        }
-    },
-
-    async getAllForExport() {
-        try {
-            const [rows] = await pool.query(`SELECT * FROM resources ORDER BY created_at DESC`);
-            return rows;
-        } catch (err) { return []; }
+        return true;
     }
 };
-module.exports = ResourceMgr;
+
+module.exports = Organizer;
 EOF
 
-# 3. 升级 api.js (新增独立刮削接口)
-echo "📝 [2/3] 升级 API 接口 (新增 /organize)..."
+# 3. 升级 api.js (传递 Organizer 日志)
+echo "📝 [2/3] 升级 API 接口..."
 cat > routes/api.js << 'EOF'
 const express = require('express');
 const axios = require('axios');
@@ -177,11 +224,15 @@ router.get('/status', (req, res) => {
         logs = ScraperXChina.getState().logs;
         scraped = ScraperXChina.getState().totalScraped;
     }
+    // 🔥 关键修改：将 Organizer 的日志和队列状态传给前端
+    const organizerState = Organizer.getState();
+    
     res.json({ 
         config: global.CONFIG, 
         state: { isRunning: Scraper.getState().isRunning || ScraperXChina.getState().isRunning, logs, totalScraped: scraped }, 
         renamerState: Renamer.getState(),
-        organizerQueue: Organizer.getState().queue, 
+        organizerLogs: organizerState.logs, // 传递日志
+        organizerQueue: organizerState.queue, // 传递队列数
         version: global.CURRENT_VERSION 
     });
 });
@@ -231,8 +282,6 @@ router.post('/renamer/start', (req, res) => {
     Renamer.start(parseInt(req.body.pages) || 0, req.body.force === true);
     res.json({ success: true });
 });
-
-// 1. 推送接口 (仅负责推送到 115)
 router.post('/push', async (req, res) => {
     const magnets = req.body.magnets || [];
     if (!global.CONFIG.cookie115) return res.json({ success: false, msg: "未登录115" });
@@ -253,19 +302,15 @@ router.post('/push', async (req, res) => {
         res.json({ success: true, count: successCount, msg: "推送成功" });
     } catch (e) { res.json({ success: false, msg: e.message }); }
 });
-
-// 2. 🔥 新增：独立刮削接口 (仅负责整理)
 router.post('/organize', async (req, res) => {
     const ids = req.body.ids || [];
     if (!global.CONFIG.cookie115) return res.json({ success: false, msg: "未登录115" });
     if (ids.length === 0) return res.json({ success: false, msg: "未选择任务" });
 
     try {
-        // 查出完整信息
         const items = await ResourceMgr.getByIds(ids);
         if (items.length === 0) return res.json({ success: false, msg: "未找到记录" });
 
-        // 加入队列
         let count = 0;
         items.forEach(item => {
             Organizer.addTask(item);
@@ -274,7 +319,6 @@ router.post('/organize', async (req, res) => {
         res.json({ success: true, count: count, msg: "已加入后台刮削队列" });
     } catch (e) { res.json({ success: false, msg: e.message }); }
 });
-
 router.post('/delete', async (req, res) => {
     const ids = req.body.ids || [];
     if (ids.length === 0) return res.json({ success: false, msg: "未选择删除项" });
@@ -352,8 +396,8 @@ router.post('/system/online-update', async (req, res) => {
 module.exports = router;
 EOF
 
-# 4. 更新前端 (分离按钮)
-echo "📝 [3/3] 升级 UI (分离推送与刮削)..."
+# 4. 更新前端 index.html (添加日志窗口)
+echo "📝 [3/3] 升级前端界面 (添加日志展示)..."
 cat > public/index.html << 'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -371,7 +415,7 @@ cat > public/index.html << 'EOF'
         .nav-item { padding: 12px; color: var(--text-sub); border-radius: 8px; margin-bottom: 8px; cursor: pointer; display: block; text-decoration: none; }
         .nav-item:hover { background: rgba(255,255,255,0.05); color: #fff; }
         .nav-item.active { background: var(--primary); color: white; }
-        .main { flex: 1; padding: 30px; overflow-y: auto; }
+        .main { flex: 1; padding: 30px; overflow-y: auto; display: flex; flex-direction: column; }
         .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; margin-bottom: 24px; }
         .btn { padding: 8px 16px; border-radius: 6px; border: none; cursor: pointer; color: white; font-size: 14px; }
         .btn-pri { background: var(--primary); }
@@ -380,7 +424,7 @@ cat > public/index.html << 'EOF'
         input, select, textarea { width: 100%; background: rgba(0,0,0,0.2); border: 1px solid var(--border); padding: 8px; color: white; border-radius: 6px; }
         .log-box { background: #0b1120; height: 300px; overflow-y: auto; padding: 15px; font-family: monospace; font-size: 12px; border-radius: 8px; }
         .log-entry.suc { color: #4ade80; } .log-entry.err { color: #f87171; } .log-entry.warn { color: #fbbf24; }
-        .table-container { overflow-x: auto; }
+        .table-container { overflow-x: auto; flex: 1; min-height: 300px;}
         table { width: 100%; border-collapse: collapse; font-size: 13px; }
         th, td { text-align: left; padding: 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
         th { color: var(--text-sub); background: rgba(0,0,0,0.2); }
@@ -459,9 +503,9 @@ cat > public/index.html << 'EOF'
             </div>
         </div>
 
-        <div id="database" class="page hidden">
+        <div id="database" class="page hidden" style="height:100%; display:flex; flex-direction:column;">
             <h2>资源数据库</h2>
-            <div class="card" style="padding:0;">
+            <div class="card" style="padding:0; flex:1; display:flex; flex-direction:column; min-height:0;">
                 <div style="padding:15px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center">
                     <div>
                         <button class="btn btn-info" onclick="pushSelected()">📤 仅推送</button>
@@ -470,7 +514,7 @@ cat > public/index.html << 'EOF'
                     </div>
                     <div id="total-count">Loading...</div>
                 </div>
-                <div class="table-container">
+                <div class="table-container" style="overflow-y:auto;">
                     <table id="db-tbl">
                         <thead>
                             <tr>
@@ -484,10 +528,14 @@ cat > public/index.html << 'EOF'
                         <tbody></tbody>
                     </table>
                 </div>
-                <div style="padding:15px;text-align:center;">
+                <div style="padding:15px;text-align:center;border-top:1px solid var(--border)">
                     <button class="btn btn-pri" onclick="loadDb(dbPage-1)">上一页</button>
                     <span id="page-info" style="margin:0 15px;color:var(--text-sub)">1</span>
                     <button class="btn btn-pri" onclick="loadDb(dbPage+1)">下一页</button>
+                </div>
+                <div style="height:150px; background:#000; border-top:1px solid var(--border); overflow:hidden; display:flex; flex-direction:column;">
+                    <div style="padding:5px 15px; background:#111; font-size:12px; font-weight:bold; color:#888;">📋 刮削/整理日志</div>
+                    <div id="log-org" class="log-box" style="flex:1; border:none; border-radius:0; height:auto;"></div>
                 </div>
             </div>
         </div>
@@ -525,17 +573,53 @@ cat > public/index.html << 'EOF'
 
     <script src="js/app.js"></script>
     <script>
-        // 覆盖部分 JS 逻辑以支持新按钮
+        async function loadDb(p) {
+            if(p < 1) return;
+            dbPage = p;
+            document.getElementById('page-info').innerText = p;
+            const res = await request(`data?page=${p}`);
+            const tbody = document.querySelector('#db-tbl tbody');
+            tbody.innerHTML = '';
+            if(res.data) {
+                document.getElementById('total-count').innerText = "总计: " + (res.total || 0);
+                res.data.forEach(r => {
+                    const chkValue = `${r.id}|${r.magnets}`;
+                    const imgHtml = r.image_url ? `<img src="${r.image_url}" class="cover-img" loading="lazy" onclick="window.open('${r.link}')" style="cursor:pointer">` : `<div class="cover-img" style="display:flex;align-items:center;justify-content:center;color:#555;font-size:10px">无封面</div>`;
+                    let statusTags = "";
+                    if (r.is_pushed) statusTags += `<span class="tag" style="color:#34d399;background:rgba(16,185,129,0.1)">已推</span>`;
+                    if (r.is_renamed) statusTags += `<span class="tag" style="color:#60a5fa;background:rgba(59,130,246,0.1)">已整</span>`;
+                    let metaTags = "";
+                    if (r.actor) metaTags += `<span class="tag tag-actor">👤 ${r.actor}</span>`;
+                    if (r.category) metaTags += `<span class="tag tag-cat">🏷️ ${r.category}</span>`;
+                    let cleanMagnet = r.magnets || '';
+                    if (cleanMagnet.includes('&')) cleanMagnet = cleanMagnet.split('&')[0];
+                    const magnetDisplay = cleanMagnet ? `<div class="magnet-link" onclick="navigator.clipboard.writeText('${cleanMagnet}');alert('磁力已复制')">🔗 ${cleanMagnet.substring(0,20)}...</div>` : '';
+                    tbody.innerHTML += `<tr><td><input type="checkbox" class="row-chk" value="${chkValue}"></td><td>${imgHtml}</td><td><div style="font-weight:500;margin-bottom:4px;max-width:300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${r.title}</div><div style="font-size:12px;color:var(--text-sub);font-family:monospace">${r.code || '无番号'}</div>${magnetDisplay}</td><td>${metaTags}</td><td>${statusTags}</td></tr>`;
+                });
+            }
+        }
+
+        function startScrape(type) {
+            const src = document.getElementById('scr-source').value;
+            const targetUrl = document.getElementById('scr-target-url').value;
+            const dl = getDlState();
+            api('start', { type: type, source: src, autoDownload: dl, targetUrl: targetUrl });
+        }
+
+        async function deleteSelected() {
+            const checkboxes = document.querySelectorAll('.row-chk:checked');
+            if (checkboxes.length === 0) { alert("请先勾选!"); return; }
+            if(!confirm(\`删除 \${checkboxes.length} 条记录?\`)) return;
+            const ids = Array.from(checkboxes).map(cb => cb.value.split('|')[0]);
+            try { await request('delete', { method: 'POST', body: JSON.stringify({ ids }) }); loadDb(dbPage); } catch(e) {}
+        }
+
         async function pushSelected() {
             const checkboxes = document.querySelectorAll('.row-chk:checked');
             if (checkboxes.length === 0) { alert("请先勾选!"); return; }
-            const magnets = Array.from(checkboxes).map(cb => {
-                // value="${r.id}|${r.magnets}"
-                return cb.value;
-            });
+            const magnets = Array.from(checkboxes).map(cb => cb.value);
             const btn = event.target; btn.innerText = "处理中..."; btn.disabled = true;
             try { 
-                // organize=false, 只推送
                 const res = await request('push', { method: 'POST', body: JSON.stringify({ magnets, organize: false }) }); 
                 if (res.success) { alert(\`✅ 推送成功: \${res.count}\`); loadDb(dbPage); } else { alert(\`❌ \${res.msg}\`); }
             } catch(e) { alert("网络错误"); }
@@ -545,15 +629,54 @@ cat > public/index.html << 'EOF'
         async function organizeSelected() {
             const checkboxes = document.querySelectorAll('.row-chk:checked');
             if (checkboxes.length === 0) { alert("请先勾选!"); return; }
-            const ids = Array.from(checkboxes).map(cb => cb.value.split('|')[0]); // 提取ID
-            
+            const ids = Array.from(checkboxes).map(cb => cb.value.split('|')[0]);
             const btn = event.target; btn.innerText = "请求中..."; btn.disabled = true;
             try { 
                 const res = await request('organize', { method: 'POST', body: JSON.stringify({ ids }) }); 
-                if (res.success) { alert(\`✅ 已加入刮削队列: \${res.count} 个\`); } else { alert(\`❌ \${res.msg}\`); }
+                if (res.success) { alert(\`✅ 已加入队列: \${res.count}\`); } else { alert(\`❌ \${res.msg}\`); }
             } catch(e) { alert("网络错误"); }
             btn.innerText = "🛠️ 仅刮削"; btn.disabled = false;
         }
+        
+        async function saveCfg() {
+            const proxy = document.getElementById('cfg-proxy').value;
+            const cookie115 = document.getElementById('cfg-cookie').value;
+            const flaresolverrUrl = document.getElementById('cfg-flare').value;
+            const targetCid = document.getElementById('cfg-target-cid').value;
+            await request('config', { method: 'POST', body: JSON.stringify({ proxy, cookie115, flaresolverrUrl, targetCid }) });
+            alert('保存成功');
+        }
+
+        // 修改轮询逻辑以显示 Organizer 日志
+        let lastLogTimeScr = "";
+        let lastLogTimeOrg = "";
+        setInterval(async () => {
+            if(!document.getElementById('lock').classList.contains('hidden')) return;
+            const res = await request('status');
+            if(!res.config) return;
+            
+            const renderLog = (elId, logs, lastTimeVar) => {
+                const el = document.getElementById(elId);
+                if(!el) return lastTimeVar;
+                if(logs && logs.length > 0) {
+                    const latestLog = logs[logs.length-1];
+                    const latestSignature = latestLog.time + latestLog.msg;
+                    if (latestSignature !== lastTimeVar) {
+                        el.innerHTML = logs.map(l => \`<div class="log-entry \${l.type==='error'?'err':l.type==='success'?'suc':l.type==='warn'?'warn':''}">\${l.time} \${l.msg}</div>\`).join('');
+                        el.scrollTop = el.scrollHeight;
+                        return latestSignature;
+                    }
+                }
+                return lastTimeVar;
+            };
+            
+            // 采集日志
+            lastLogTimeScr = renderLog('log-scr', res.state.logs, lastLogTimeScr);
+            // 刮削日志 (资源库底部)
+            lastLogTimeOrg = renderLog('log-org', res.organizerLogs, lastLogTimeOrg);
+            
+            if(document.getElementById('stat-scr')) document.getElementById('stat-scr').innerText = res.state.totalScraped || 0;
+        }, 2000);
     </script>
 </body>
 </html>
@@ -563,4 +686,4 @@ EOF
 echo "🔄 重启应用以生效..."
 pkill -f "node app.js" || echo "应用可能未运行。"
 
-echo "✅ [完成] 独立刮削版 V13.12.2 部署完成。"
+echo "✅ [完成] 可视化反馈版 V13.13.0 部署完成！"
