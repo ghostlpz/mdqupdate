@@ -1,19 +1,22 @@
 #!/bin/bash
-# VERSION = 13.7.0
+# VERSION = 13.7.1
 
 # ---------------------------------------------------------
 # Madou-Omni 在线升级脚本 (Docker 容器版)
-# 版本: V13.7.0
+# 版本: V13.7.1
+# 修复: xChina 采集模块增加 Proxy 透传，解决 Flaresolverr 连接超时
 # ---------------------------------------------------------
 
-echo "🚀 [Update] 开始执行容器内热更新 (V13.7.0)..."
+echo "🚀 [Update] 开始执行容器内热更新 (V13.7.1)..."
+echo "📂 当前工作目录: $(pwd)"
 
 # 1. 更新 package.json
-# 注意：容器内直接操作 package.json，不需要 app/ 前缀new
+# 直接修改当前目录下的 package.json
 echo "📝 [1/6] 更新版本号..."
-sed -i 's/"version": "13.6.0"/"version": "13.7.0"/' package.json
+sed -i 's/"version": ".*"/"version": "13.7.1"/' package.json
 
 # 2. 更新 modules/resource_mgr.js
+# 路径：./modules/resource_mgr.js
 echo "📝 [2/6] 升级资源管理器..."
 cat > modules/resource_mgr.js << 'EOF'
 const { pool } = require('./db');
@@ -107,7 +110,9 @@ module.exports = ResourceMgr;
 EOF
 
 # 3. 创建 modules/scraper_xchina.js
-echo "📝 [3/6] 部署 xChina 采集核心..."
+# 路径：./modules/scraper_xchina.js
+# 重点：此处已添加 proxy 逻辑
+echo "📝 [3/6] 部署 xChina 采集核心 (含代理修复)..."
 cat > modules/scraper_xchina.js << 'EOF'
 const axios = require('axios');
 const cheerio = require('cheerio');
@@ -123,11 +128,20 @@ function log(msg, type = 'info') {
 
 async function requestViaFlare(url) {
     try {
-        const res = await axios.post('http://flaresolverr:8191/v1', {
+        const payload = {
             cmd: 'request.get',
             url: url,
             maxTimeout: 60000
-        }, { headers: { 'Content-Type': 'application/json' } });
+        };
+
+        // 🔥 关键修复：将系统配置的代理传给 Flaresolverr
+        if (global.CONFIG.proxy) {
+            payload.proxy = { url: global.CONFIG.proxy };
+        }
+
+        const res = await axios.post('http://flaresolverr:8191/v1', payload, { 
+            headers: { 'Content-Type': 'application/json' } 
+        });
 
         if (res.data.status === 'ok') {
             return cheerio.load(res.data.solution.response);
@@ -165,7 +179,7 @@ const ScraperXChina = {
         STATE.stopSignal = false;
         STATE.totalScraped = 0;
         
-        log(`🚀 xChina 任务启动 | 目标: ${limitPages}页 | 自动下载: ${autoDownload ? '✅' : '❌'}`, 'success');
+        log(`🚀 xChina 任务启动 | 目标: ${limitPages}页 | 代理: ${global.CONFIG.proxy ? '✅已启用' : '❌未配置'}`, 'success');
 
         try {
             try { await axios.get('http://flaresolverr:8191/'); } 
@@ -250,6 +264,7 @@ module.exports = ScraperXChina;
 EOF
 
 # 4. 更新 routes/api.js
+# 路径：./routes/api.js
 echo "📝 [4/6] 更新 API 路由逻辑..."
 cat > routes/api.js << 'EOF'
 const express = require('express');
@@ -451,6 +466,7 @@ module.exports = router;
 EOF
 
 # 5. 更新 public/index.html
+# 路径：./public/index.html
 echo "📝 [5/6] 刷新前端 UI..."
 cat > public/index.html << 'EOF'
 <!DOCTYPE html>
@@ -790,6 +806,7 @@ cat > public/index.html << 'EOF'
 EOF
 
 # 6. 更新 public/js/app.js
+# 路径：./public/js/app.js
 echo "📝 [6/6] 更新 JS 逻辑..."
 cat > public/js/app.js << 'EOF'
 let dbPage = 1;
@@ -938,6 +955,8 @@ async function showQr() {
 EOF
 
 # 7. 重启应用
-echo "🔄 重启应用以生效..."
-# 在容器内，我们直接 kill node 进程让 Docker 自动重启
-pkill -f "node app.js" || echo "尝试自动重启中..."
+# 在容器内部，我们需要通过杀死 node 进程来触发 Docker 的自动重启机制
+echo "🔄 尝试重启应用..."
+pkill -f "node app.js" || echo "应用可能未运行或已停止。"
+
+echo "✅ [完成] 更新脚本已执行完毕，系统即将重启。"
