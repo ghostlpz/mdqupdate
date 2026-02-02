@@ -1,196 +1,27 @@
 #!/bin/bash
-# VERSION = 13.8.0
+# VERSION = 13.9.0
 
 # ---------------------------------------------------------
 # Madou-Omni 在线升级脚本
-# 版本: V13.8.0
-# 核心升级: 全字段采集 (封面/演员/分类/番号) + 前端UI重构展示
+# 版本: V13.9.0
+# 核心升级: 支持配置外部 Flaresolverr 地址，减轻本机负载
 # ---------------------------------------------------------
 
-echo "🚀 [Update] 开始部署旗舰版 (V13.8.0)..."
+echo "🚀 [Update] 开始部署外挂 Flaresolverr 版 (V13.9.0)..."
 
 # 1. 更新 package.json
-sed -i 's/"version": ".*"/"version": "13.8.0"/' package.json
+sed -i 's/"version": ".*"/"version": "13.9.0"/' package.json
 
-# 2. 升级数据库 (增加 actor 和 category 字段)
-echo "📝 [1/4] 升级数据库结构..."
-cat > modules/db.js << 'EOF'
-const mysql = require('mysql2/promise');
-const dbConfig = {
-    host: process.env.DB_HOST || 'db',
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || 'zzxx1122',
-    database: 'crawler_db',
-    waitForConnections: true,
-    connectionLimit: 10
-};
-const pool = mysql.createPool(dbConfig);
-
-async function initDB() {
-    let retries = 20;
-    while (retries > 0) {
-        try {
-            const tempConn = await mysql.createConnection({
-                host: dbConfig.host, user: dbConfig.user, password: dbConfig.password
-            });
-            await tempConn.query(`CREATE DATABASE IF NOT EXISTS crawler_db;`);
-            await tempConn.end();
-            
-            await pool.query(`
-                CREATE TABLE IF NOT EXISTS resources (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    title TEXT,
-                    link VARCHAR(255) UNIQUE,
-                    magnets TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    INDEX idx_link (link),
-                    INDEX idx_created (created_at)
-                );
-            `);
-
-            // ⚡️ V13.8.0: 字段全量补全
-            const upgradeCols = [
-                "ALTER TABLE resources ADD COLUMN is_pushed BOOLEAN DEFAULT 0",
-                "ALTER TABLE resources ADD COLUMN is_renamed BOOLEAN DEFAULT 0",
-                "ALTER TABLE resources ADD COLUMN code VARCHAR(100) DEFAULT NULL",
-                "ALTER TABLE resources ADD COLUMN image_url TEXT DEFAULT NULL",
-                "ALTER TABLE resources ADD COLUMN actor VARCHAR(100) DEFAULT NULL",
-                "ALTER TABLE resources ADD COLUMN category VARCHAR(100) DEFAULT NULL"
-            ];
-
-            for (const sql of upgradeCols) {
-                try {
-                    await pool.query(sql);
-                } catch (e) {
-                    if (e.code !== 'ER_DUP_FIELDNAME') console.log("DB Msg:", e.message);
-                }
-            }
-
-            console.log("✅ 数据库结构校验完成");
-            return;
-        } catch (err) {
-            console.log(`⏳ DB 连接重试 (${retries})...`);
-            await new Promise(r => setTimeout(r, 5000));
-            retries--;
-        }
-    }
-}
-module.exports = { pool, initDB };
-EOF
-
-# 3. 升级 ResourceMgr (写入新字段)
-echo "📝 [2/4] 升级数据存储逻辑..."
-cat > modules/resource_mgr.js << 'EOF'
-const { pool } = require('./db');
-
-function hexToBase32(hex) {
-    const alphabet = 'abcdefghijklmnopqrstuvwxyz234567';
-    let binary = '';
-    for (let i = 0; i < hex.length; i++) {
-        binary += parseInt(hex[i], 16).toString(2).padStart(4, '0');
-    }
-    let base32 = '';
-    for (let i = 0; i < binary.length; i += 5) {
-        const chunk = binary.substr(i, 5);
-        const index = parseInt(chunk.padEnd(5, '0'), 2);
-        base32 += alphabet[index];
-    }
-    return base32;
-}
-
-const ResourceMgr = {
-    // V13.8.0: 增加 actor 和 category
-    async save(data) {
-        // 兼容旧调用方式 save(title, link, magnets)
-        if (arguments.length > 1 && typeof arguments[0] === 'string') {
-            data = {
-                title: arguments[0],
-                link: arguments[1],
-                magnets: arguments[2],
-                code: arguments[3] || null,
-                image: arguments[4] || null
-            };
-        }
-
-        try {
-            const [result] = await pool.execute(
-                'INSERT IGNORE INTO resources (title, link, magnets, code, image_url, actor, category) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                [
-                    data.title, 
-                    data.link, 
-                    data.magnets, 
-                    data.code || null, 
-                    data.image || null, 
-                    data.actor || null, 
-                    data.category || null
-                ]
-            );
-            return { success: true, newInsert: result.affectedRows > 0 };
-        } catch (err) { 
-            console.error(err);
-            return { success: false, newInsert: false }; 
-        }
-    },
-    
-    async queryByHash(hash) {
-        if (!hash) return null;
-        try {
-            const inputHash = hash.trim().toLowerCase();
-            // 模糊匹配以兼容旧数据
-            const [rows] = await pool.query(
-                'SELECT title, is_renamed FROM resources WHERE magnets LIKE ? OR magnets LIKE ? LIMIT 1',
-                [`%${inputHash}%`, `%${inputHash.toUpperCase()}%`]
-            );
-            return rows.length > 0 ? rows[0] : null;
-        } catch (err) { return null; }
-    },
-
-    async markAsPushed(id) { try { await pool.query('UPDATE resources SET is_pushed = 1 WHERE id = ?', [id]); } catch (e) {} },
-    async markAsPushedByLink(link) { try { await pool.query('UPDATE resources SET is_pushed = 1 WHERE link = ?', [link]); } catch (e) {} },
-    async markAsRenamedByTitle(title) { try { await pool.query('UPDATE resources SET is_renamed = 1 WHERE title = ?', [title]); } catch (e) {} },
-
-    async getList(page, limit, filters = {}) {
-        try {
-            const offset = (page - 1) * limit;
-            let whereClause = "";
-            const conditions = [];
-            if (filters.pushed === '1') conditions.push("is_pushed = 1");
-            if (filters.pushed === '0') conditions.push("is_pushed = 0");
-            if (filters.renamed === '1') conditions.push("is_renamed = 1");
-            if (filters.renamed === '0') conditions.push("is_renamed = 0");
-            if (conditions.length > 0) whereClause = " WHERE " + conditions.join(" AND ");
-
-            const countSql = `SELECT COUNT(*) as total FROM resources${whereClause}`;
-            const [countRows] = await pool.query(countSql);
-            const total = countRows[0].total;
-
-            const dataSql = `SELECT * FROM resources${whereClause} ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}`;
-            const [rows] = await pool.query(dataSql);
-            return { total, data: rows };
-        } catch (err) {
-            console.error(err);
-            return { total: 0, data: [], error: err.message };
-        }
-    },
-
-    async getAllForExport() {
-        try {
-            const [rows] = await pool.query(`SELECT * FROM resources ORDER BY created_at DESC`);
-            return rows;
-        } catch (err) { return []; }
-    }
-};
-module.exports = ResourceMgr;
-EOF
-
-# 4. 升级 scraper_xchina.js (全字段解析逻辑)
-echo "📝 [3/4] 升级采集核心 (解析所有HTML元素)..."
+# 2. 升级 scraper_xchina.js (支持动态 Flaresolverr 地址)
+echo "📝 [1/3] 升级采集核心 (支持外部服务)..."
 cat > modules/scraper_xchina.js << 'EOF'
 const axios = require('axios');
 const cheerio = require('cheerio');
 const ResourceMgr = require('./resource_mgr');
 
+// ⚡️ 并发数
 const CONCURRENCY_LIMIT = 3;
+// ⚡️ 最大重试次数
 const MAX_RETRIES = 3;
 
 let STATE = { isRunning: false, stopSignal: false, logs: [], totalScraped: 0 };
@@ -208,12 +39,23 @@ function cleanMagnet(magnet) {
     return magnet.split('&')[0];
 }
 
+// 🔧 获取配置的 Flaresolverr 地址
+function getFlareUrl() {
+    let url = global.CONFIG.flaresolverrUrl || 'http://flaresolverr:8191';
+    // 去除末尾斜杠
+    if (url.endsWith('/')) url = url.slice(0, -1);
+    // 自动补全 /v1 接口路径
+    if (!url.endsWith('/v1')) url += '/v1';
+    return url;
+}
+
 async function requestViaFlare(url) {
+    const flareApi = getFlareUrl();
     try {
         const payload = { cmd: 'request.get', url: url, maxTimeout: 60000 };
         if (global.CONFIG.proxy) payload.proxy = { url: global.CONFIG.proxy };
 
-        const res = await axios.post('http://flaresolverr:8191/v1', payload, { 
+        const res = await axios.post(flareApi, payload, { 
             headers: { 'Content-Type': 'application/json' } 
         });
 
@@ -258,47 +100,25 @@ async function processVideoTaskWithRetry(task, baseUrl, autoDownload) {
     return false;
 }
 
-// 核心：单视频全字段解析
 async function processVideoTask(task, baseUrl, autoDownload) {
-    // task.link 是详情页地址
     const { link } = task; 
-
-    // 1. 进入详情页 (必须进，为了获取元数据)
     const $ = await requestViaFlare(link);
     
-    // --- 解析开始 ---
-    
-    // 2. 获取标题 (优先 H1，或者 fallback 到 task.title)
     let title = $('h1').text().trim() || task.title;
-
-    // 3. 获取封面 (解析 video-js poster)
-    // 元素: <div class="vjs-poster"><picture><img src="..."></picture></div>
     let image = $('.vjs-poster img').attr('src');
     if (image && !image.startsWith('http')) image = baseUrl + image;
-
-    // 4. 获取演员 (Model)
-    // 元素: <div class="model-container"><a ...>沈娜娜</a></div>
     const actor = $('.model-container .model-item').text().trim() || '未知演员';
-
-    // 5. 获取分类 (Category)
-    // 元素: <div class="text">...<span class="joiner">-</span><a ...>麻豆传媒</a></div>
-    // 逻辑: 找到包含 joiner 的 text 块，取最后一个 a 标签
+    
     let category = '';
     $('.text').each((i, el) => {
-        if ($(el).find('.joiner').length > 0) {
-            category = $(el).find('a').last().text().trim();
-        }
+        if ($(el).find('.joiner').length > 0) category = $(el).find('a').last().text().trim();
     });
     if (!category) category = '未分类';
 
-    // 6. 提取番号 (Code) - 从 URL 提取
     let code = '';
     const codeMatch = link.match(/id-([a-zA-Z0-9]+)/);
     if (codeMatch) code = codeMatch[1];
 
-    // --- 解析结束 ---
-
-    // 7. 提取下载链接
     const downloadLinkEl = $('a[href*="/download/id-"]');
     if (downloadLinkEl.length === 0) throw new Error("无下载入口");
 
@@ -307,13 +127,11 @@ async function processVideoTask(task, baseUrl, autoDownload) {
         downloadPageUrl = baseUrl + downloadPageUrl;
     }
 
-    // 8. 进入下载页取磁力
     const $down = await requestViaFlare(downloadPageUrl);
     const rawMagnet = $down('a.btn.magnet').attr('href');
     const magnet = cleanMagnet(rawMagnet);
 
     if (magnet && magnet.startsWith('magnet:')) {
-        // 保存所有字段
         const saveRes = await ResourceMgr.save({
             title, link, magnets: magnet, code, image, actor, category
         });
@@ -327,8 +145,7 @@ async function processVideoTask(task, baseUrl, autoDownload) {
                     extraMsg = pushed ? " | 📥 已推115" : " | ⚠️ 推送失败";
                     if(pushed) await ResourceMgr.markAsPushedByLink(link);
                 }
-                // 日志显示更丰富的信息
-                log(`✅ [入库] ${code} | ${actor} | ${title.substring(0, 10)}...${extraMsg}`, 'success');
+                log(`✅ [入库] ${code} | ${title.substring(0, 10)}...${extraMsg}`, 'success');
                 return true;
             } else {
                 log(`⏭️ [已存在] ${title.substring(0, 10)}...`, 'info');
@@ -352,11 +169,16 @@ const ScraperXChina = {
         STATE.stopSignal = false;
         STATE.totalScraped = 0;
         
-        log(`🚀 xChina 旗舰版 (V13.8.0) | 全信息采集`, 'success');
+        const flareUrl = getFlareUrl().replace('/v1',''); // 仅用于日志显示
+        log(`🚀 xChina 外挂版 (V13.9.0) | Flare: ${flareUrl}`, 'success');
 
         try {
-            try { await axios.get('http://flaresolverr:8191/'); } 
-            catch (e) { throw new Error("无法连接 Flaresolverr"); }
+            // 检查外部 Flaresolverr 连通性
+            // 移除 /v1 检查根路径，因为 /v1 只接受 POST
+            const checkUrl = flareUrl.replace(/\/v1\/?$/, '') || 'http://flaresolverr:8191';
+            
+            try { await axios.get(checkUrl, { timeout: 5000 }); } 
+            catch (e) { throw new Error(`无法连接外部 Flaresolverr: ${checkUrl} (${e.message})`); }
 
             let page = 1;
             const baseUrl = "https://xchina.co";
@@ -375,7 +197,6 @@ const ScraperXChina = {
                     let newItemsInPage = 0;
                     const tasks = [];
                     
-                    // 仅从列表页提取基础链接和标题，详情在 processVideoTask 中获取
                     items.each((i, el) => {
                         const title = $(el).find('.text .title a').text().trim();
                         let subLink = $(el).find('.text .title a').attr('href');
@@ -413,8 +234,8 @@ const ScraperXChina = {
 module.exports = ScraperXChina;
 EOF
 
-# 5. 重构前端 index.html (展示海报和新字段)
-echo "📝 [4/4] 重构前端界面 (支持海报墙模式)..."
+# 3. 更新 public/index.html (增加设置项)
+echo "📝 [2/3] 更新前端设置界面..."
 cat > public/index.html << 'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -531,21 +352,20 @@ cat > public/index.html << 'EOF'
             </div>
         </div>
 
-        <div id="renamer" class="page hidden">
-            <div class="card">
-                <h2>115 整理助手</h2>
-                <div class="input-group"><label>扫描页数</label><input type="number" id="r-pages" value="0"></div>
-                <div class="input-group"><input type="checkbox" id="r-force" style="width:auto"> <label style="display:inline">强制重整</label></div>
-                <button class="btn btn-pri" onclick="startRenamer()">开始整理</button>
-                <div id="log-ren" class="log-box" style="margin-top:20px;height:200px"></div>
-            </div>
-        </div>
         <div id="settings" class="page hidden">
             <div class="card">
                 <h2>系统设置</h2>
-                <div class="input-group"><label>HTTP 代理</label><input id="cfg-proxy"></div>
+                <div class="input-group">
+                    <label>HTTP 代理 (例如 http://192.168.1.5:7890)</label>
+                    <input id="cfg-proxy">
+                </div>
+                <div class="input-group">
+                    <label>Flaresolverr 地址 (留空则使用内置, 外部如 http://192.168.1.6:8191)</label>
+                    <input id="cfg-flare" placeholder="http://flaresolverr:8191">
+                </div>
+                
                 <div class="input-group"><label>115 Cookie</label><textarea id="cfg-cookie" rows="3"></textarea></div>
-                <button class="btn btn-pri" onclick="saveCfg()">保存</button>
+                <button class="btn btn-pri" onclick="saveCfg()">保存配置</button>
                 <hr style="border:0;border-top:1px solid var(--border);margin:20px 0">
                 <div style="display:flex;justify-content:space-between;align-items:center">
                     <div>当前版本: <span id="cur-ver" style="color:var(--primary);font-weight:bold">Loading</span></div>
@@ -553,6 +373,14 @@ cat > public/index.html << 'EOF'
                 </div>
                 <button class="btn btn-info" style="margin-top:10px" onclick="showQr()">扫码登录 115</button>
             </div>
+        </div>
+        
+        <div id="renamer" class="page hidden">
+            <div class="card"><h2>115 整理助手</h2>
+            <div class="input-group"><label>扫描页数</label><input type="number" id="r-pages" value="0"></div>
+            <div class="input-group"><input type="checkbox" id="r-force" style="width:auto"><label style="display:inline">强制重整</label></div>
+            <button class="btn btn-pri" onclick="startRenamer()">开始整理</button>
+            <div id="log-ren" class="log-box" style="margin-top:20px;height:200px"></div></div>
         </div>
     </div>
 
@@ -566,46 +394,27 @@ cat > public/index.html << 'EOF'
 
     <script src="js/app.js"></script>
     <script>
-        // 覆盖 app.js 中的 loadDb 以适应新 UI
         async function loadDb(p) {
             if(p < 1) return;
             dbPage = p;
             document.getElementById('page-info').innerText = p;
-            
             const res = await request(`data?page=${p}`);
             const tbody = document.querySelector('#db-tbl tbody');
             tbody.innerHTML = '';
-            
             if(res.data) {
                 document.getElementById('total-count').innerText = "总计: " + (res.total || 0);
                 res.data.forEach(r => {
                     const chkValue = `${r.id}|${r.magnets}`;
-                    // 处理封面图 (如果没有则用默认占位)
                     const imgHtml = r.image_url ? 
                         `<img src="${r.image_url}" class="cover-img" loading="lazy" onclick="window.open('${r.link}')" style="cursor:pointer">` : 
                         `<div class="cover-img" style="display:flex;align-items:center;justify-content:center;color:#555;font-size:10px">无封面</div>`;
-                    
-                    // 状态标签
                     let statusTags = "";
                     if (r.is_pushed) statusTags += `<span class="tag" style="color:#34d399;background:rgba(16,185,129,0.1)">已推</span>`;
                     if (r.is_renamed) statusTags += `<span class="tag" style="color:#60a5fa;background:rgba(59,130,246,0.1)">已整</span>`;
-
-                    // 元数据标签
                     let metaTags = "";
                     if (r.actor) metaTags += `<span class="tag tag-actor">👤 ${r.actor}</span>`;
                     if (r.category) metaTags += `<span class="tag tag-cat">🏷️ ${r.category}</span>`;
-
-                    tbody.innerHTML += `
-                        <tr>
-                            <td><input type="checkbox" class="row-chk" value="${chkValue}"></td>
-                            <td>${imgHtml}</td>
-                            <td>
-                                <div style="font-weight:500;margin-bottom:4px;max-width:300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${r.title}</div>
-                                <div style="font-size:12px;color:var(--text-sub);font-family:monospace">${r.code || '无番号'}</div>
-                            </td>
-                            <td>${metaTags}</td>
-                            <td>${statusTags}</td>
-                        </tr>`;
+                    tbody.innerHTML += `<tr><td><input type="checkbox" class="row-chk" value="${chkValue}"></td><td>${imgHtml}</td><td><div style="font-weight:500;margin-bottom:4px;max-width:300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${r.title}</div><div style="font-size:12px;color:var(--text-sub);font-family:monospace">${r.code || '无番号'}</div></td><td>${metaTags}</td><td>${statusTags}</td></tr>`;
                 });
             }
         }
@@ -614,8 +423,159 @@ cat > public/index.html << 'EOF'
 </html>
 EOF
 
+# 4. 更新 public/js/app.js (绑定保存逻辑)
+echo "📝 [3/3] 更新 JS 配置逻辑..."
+cat > public/js/app.js << 'EOF'
+let dbPage = 1;
+let qrTimer = null;
+
+async function request(endpoint, options = {}) {
+    const token = localStorage.getItem('token');
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = token;
+    try {
+        const res = await fetch('/api/' + endpoint, { ...options, headers: { ...headers, ...options.headers } });
+        if (res.status === 401) {
+            localStorage.removeItem('token');
+            document.getElementById('lock').classList.remove('hidden');
+            throw new Error("未登录");
+        }
+        return await res.json();
+    } catch (e) { console.error(e); return { success: false, msg: e.message }; }
+}
+
+async function login() {
+    const p = document.getElementById('pass').value;
+    const res = await fetch('/api/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: p}) });
+    const data = await res.json();
+    if (data.success) { localStorage.setItem('token', p); document.getElementById('lock').classList.add('hidden'); } else { document.getElementById('msg').innerText = "密码错误"; }
+}
+
+window.onload = async () => {
+    const res = await request('check-auth');
+    if (res.authenticated) document.getElementById('lock').classList.add('hidden');
+    document.getElementById('pass').addEventListener('keypress', e => { if(e.key === 'Enter') login(); });
+};
+
+function show(id) {
+    document.querySelectorAll('.page').forEach(e => e.classList.add('hidden'));
+    document.getElementById(id).classList.remove('hidden');
+    document.querySelectorAll('.nav-item').forEach(e => e.classList.remove('active'));
+    if(event && event.target) {
+       const target = event.target.closest('.nav-item');
+       if(target) target.classList.add('active');
+    }
+    if(id === 'database') loadDb(1);
+    
+    if(id === 'settings') {
+        setTimeout(async () => {
+            const r = await request('status');
+            if(r.config) {
+                document.getElementById('cfg-proxy').value = r.config.proxy || '';
+                document.getElementById('cfg-cookie').value = r.config.cookie115 || '';
+                // 加载 Flaresolverr 地址
+                document.getElementById('cfg-flare').value = r.config.flaresolverrUrl || '';
+            }
+            if(r.version) {
+                document.getElementById('cur-ver').innerText = "V" + r.version;
+            }
+        }, 100);
+    }
+}
+
+function getDlState() { return document.getElementById('auto-dl').checked; }
+
+async function api(act, body={}) { 
+    const res = await request(act, { method: 'POST', body: JSON.stringify(body) }); 
+    if(!res.success && res.msg) alert("❌ " + res.msg);
+    if(res.success && act === 'start') alert("✅ 任务已启动");
+}
+
+function startScrape(type) {
+    const src = document.getElementById('scr-source').value;
+    const dl = getDlState();
+    api('start', { type: type, source: src, autoDownload: dl });
+}
+
+async function startRenamer() { const p = document.getElementById('r-pages').value; const f = document.getElementById('r-force').checked; api('renamer/start', { pages: p, force: f }); }
+
+async function runOnlineUpdate() {
+    const btn = event.target;
+    const oldTxt = btn.innerText;
+    btn.innerText = "⏳ 检查中...";
+    btn.disabled = true;
+    try {
+        const res = await request('system/online-update', { method: 'POST' });
+        if(res.success) {
+            alert("🚀 " + res.msg);
+            setTimeout(() => location.reload(), 15000);
+        } else {
+            alert("❌ " + res.msg);
+        }
+    } catch(e) { alert("请求失败"); }
+    btn.innerText = oldTxt;
+    btn.disabled = false;
+}
+
+async function saveCfg() {
+    const proxy = document.getElementById('cfg-proxy').value;
+    const cookie115 = document.getElementById('cfg-cookie').value;
+    const flaresolverrUrl = document.getElementById('cfg-flare').value;
+    
+    await request('config', { method: 'POST', body: JSON.stringify({ proxy, cookie115, flaresolverrUrl }) });
+    alert('保存成功');
+}
+
+function toggleAll(source) { const checkboxes = document.querySelectorAll('.row-chk'); checkboxes.forEach(cb => cb.checked = source.checked); }
+async function pushSelected() {
+    const checkboxes = document.querySelectorAll('.row-chk:checked');
+    if (checkboxes.length === 0) { alert("请先勾选需要推送的资源！"); return; }
+    const magnets = Array.from(checkboxes).map(cb => cb.value);
+    const btn = event.target; const oldText = btn.innerText; btn.innerText = "推送中..."; btn.disabled = true;
+    try { const res = await request('push', { method: 'POST', body: JSON.stringify({ magnets }) }); if (res.success) { alert(`✅ 成功推送 ${res.count} 个任务`); loadDb(dbPage); } else { alert(`❌ 失败: ${res.msg}`); } } catch(e) { alert("网络请求失败"); }
+    btn.innerText = oldText; btn.disabled = false;
+}
+
+let lastLogTimeScr = ""; let lastLogTimeRen = "";
+setInterval(async () => {
+    if(!document.getElementById('lock').classList.contains('hidden')) return;
+    const res = await request('status');
+    if(!res.config) return;
+    const renderLog = (elId, logs, lastTimeVar) => {
+        const el = document.getElementById(elId);
+        if(logs && logs.length > 0) {
+            const latestLog = logs[logs.length-1];
+            const latestSignature = latestLog.time + latestLog.msg;
+            if (latestSignature !== lastTimeVar) {
+                el.innerHTML = logs.map(l => `<div class="log-entry ${l.type==='error'?'err':l.type==='success'?'suc':l.type==='warn'?'warn':''}"><span class="time">[${l.time}]</span> ${l.msg}</div>`).join('');
+                el.scrollTop = el.scrollHeight;
+                return latestSignature;
+            }
+        }
+        return lastTimeVar;
+    };
+    lastLogTimeScr = renderLog('log-scr', res.state.logs, lastLogTimeScr);
+    lastLogTimeRen = renderLog('log-ren', res.renamerState.logs, lastLogTimeRen);
+    document.getElementById('stat-scr').innerText = res.state.totalScraped;
+}, 2000);
+
+async function showQr() {
+    const m = document.getElementById('modal'); m.style.display = 'flex';
+    const res = await request('115/qr'); if(!res.success) return;
+    const { uid, time, sign, qr_url } = res.data;
+    document.getElementById('qr-img').innerHTML = `<img src="${qr_url}" width="200">`;
+    if(qrTimer) clearInterval(qrTimer);
+    qrTimer = setInterval(async () => {
+        const chk = await request(`115/check?uid=${uid}&time=${time}&sign=${sign}`);
+        const txt = document.getElementById('qr-txt');
+        if(chk.success) { txt.innerText = "✅ 成功! 刷新..."; txt.style.color = "#0f0"; clearInterval(qrTimer); setTimeout(() => { m.style.display='none'; location.reload(); }, 1000); }
+        else if (chk.status === 1) { txt.innerText = "📱 已扫码"; txt.style.color = "#fb5"; }
+    }, 1500);
+}
+EOF
+
 # 5. 重启应用
 echo "🔄 重启应用以生效..."
 pkill -f "node app.js" || echo "应用可能未运行。"
 
-echo "✅ [完成] 旗舰版部署完成，请刷新浏览器 (Ctrl+F5) 查看新界面。"
+echo "✅ [完成] 外挂版部署完成！请进入设置页面填写 Flaresolverr 地址。"
