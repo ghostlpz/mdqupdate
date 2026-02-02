@@ -1,19 +1,21 @@
 #!/bin/bash
-# VERSION = 13.14.0
+# VERSION = 13.14.1
 
 # ---------------------------------------------------------
 # Madou-Omni 在线升级脚本
-# 版本: V13.14.0
-# 核心: xChina 分类精准采集 (内置54个厂牌 + 自选勾选)
+# 版本: V13.14.1
+# 修复: 补全 UI 界面代码，解决分类选择器不显示的问题
+# 功能: 1. xChina 精准分类采集 (54个厂牌)
+#       2. 全能刮削 (NFO/海报三件套/规范命名)
 # ---------------------------------------------------------
 
-echo "🚀 [Update] 开始部署分类精准采集版 (V13.14.0)..."
+echo "🚀 [Update] 开始部署 V13.14.1 (完整UI修复版)..."
 
 # 1. 更新 package.json
-sed -i 's/"version": ".*"/"version": "13.14.0"/' package.json
+sed -i 's/"version": ".*"/"version": "13.14.1"/' package.json
 
-# 2. 重写 scraper_xchina.js (内置分类库 + 轮询逻辑)
-echo "📝 [1/3] 升级采集核心 (内置分类库)..."
+# 2. 写入后端: scraper_xchina.js (内置分类库)
+echo "📝 [1/3] 部署采集核心..."
 cat > modules/scraper_xchina.js << 'EOF'
 const axios = require('axios');
 const cheerio = require('cheerio');
@@ -79,7 +81,7 @@ const CATEGORY_MAP = [
     { name: "其他亚洲影片", code: "series-63963ea949a82" },
     { name: "门事件", code: "series-63963de3f2a0f" },
     { name: "其他欧美影片", code: "series-6396404e6bdb5" },
-    { name: "无关情色", code: "series-66643478ceed" }
+    { name: "无关情色", code: "series-66643478ceedd" }
 ];
 
 let STATE = { isRunning: false, stopSignal: false, logs: [], totalScraped: 0 };
@@ -249,13 +251,6 @@ async function scrapeCategory(cat, baseUrl, limitPages, autoDownload) {
                 await new Promise(r => setTimeout(r, 500)); 
             }
 
-            // 增量模式下，如果连续遇到旧数据，可以跳过该分类剩余部分
-            if (newInPage === 0 && limitPages < 100) {
-                // log(`⏭️ [${cat.name}] 本页全为旧数据，跳过该分类后续页码`, 'warn');
-                // break; 
-                // 暂时不break，为了保险起见多翻几页
-            }
-
             page++;
             await new Promise(r => setTimeout(r, 1500));
 
@@ -315,14 +310,14 @@ const ScraperXChina = {
         log(`🏁 任务结束，新增资源 ${STATE.totalScraped} 条`, 'warn');
     },
     
-    // 暴露分类列表给 API，供前端获取
+    // 暴露分类列表给 API
     getCategories: () => CATEGORY_MAP
 };
 module.exports = ScraperXChina;
 EOF
 
-# 3. 升级 API (支持传递分类参数)
-echo "📝 [2/3] 升级 API 接口..."
+# 3. 写入 API: api.js (支持分类接口)
+echo "📝 [2/3] 部署 API..."
 cat > routes/api.js << 'EOF'
 const express = require('express');
 const axios = require('axios');
@@ -382,7 +377,7 @@ router.get('/status', (req, res) => {
         version: global.CURRENT_VERSION 
     });
 });
-// 🔥 新增：获取分类列表
+// 🔥 获取分类列表
 router.get('/categories', (req, res) => {
     res.json({ categories: ScraperXChina.getCategories() });
 });
@@ -546,8 +541,8 @@ router.post('/system/online-update', async (req, res) => {
 module.exports = router;
 EOF
 
-# 4. 更新前端 (增加分类勾选界面)
-echo "📝 [3/3] 升级前端界面 (分类选择器)..."
+# 4. 写入完整前端代码: index.html
+echo "📝 [3/3] 部署完整 UI..."
 cat > public/index.html << 'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -588,7 +583,6 @@ cat > public/index.html << 'EOF'
         .progress-bar-fill { height: 100%; background: var(--primary); width: 0%; transition: width 0.3s; }
         .status-text { font-size: 11px; color: #94a3b8; display: flex; justify-content: space-between; margin-bottom: 2px; }
         
-        /* 🔥 新增：分类选择器样式 */
         .cat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; max-height: 200px; overflow-y: auto; padding: 10px; background: rgba(0,0,0,0.2); border-radius: 6px; border: 1px solid var(--border); }
         .cat-item { display: flex; align-items: center; font-size: 12px; cursor: pointer; color: var(--text-sub); }
         .cat-item input { margin-right: 6px; width: auto; }
@@ -606,6 +600,7 @@ cat > public/index.html << 'EOF'
             <button class="btn btn-pri" style="width:100%" onclick="login()">解锁</button>
         </div>
     </div>
+
     <div class="sidebar">
         <div class="logo">⚡ Madou<span>Omni</span></div>
         <a class="nav-item active" onclick="show('scraper')">🕷️ 采集任务</a>
@@ -613,6 +608,7 @@ cat > public/index.html << 'EOF'
         <a class="nav-item" onclick="show('database')">💾 资源库</a>
         <a class="nav-item" onclick="show('settings')">⚙️ 系统设置</a>
     </div>
+
     <div class="main">
         <div id="scraper" class="page">
             <div class="card">
@@ -666,7 +662,7 @@ cat > public/index.html << 'EOF'
                 const res = await request('categories');
                 if(res.categories) {
                     const html = res.categories.map(c => 
-                        \`<label class="cat-item"><input type="checkbox" name="cats" value="\${c.code}"> \${c.name}</label>\`
+                        `<label class="cat-item"><input type="checkbox" name="cats" value="${c.code}"> ${c.name}</label>`
                     ).join('');
                     document.getElementById('cat-container').innerHTML = html;
                     loadedCats = true;
@@ -707,4 +703,4 @@ EOF
 echo "🔄 重启应用以生效..."
 pkill -f "node app.js" || echo "应用可能未运行。"
 
-echo "✅ [完成] V13.14.0 部署完成，请强制刷新浏览器体验新分类功能！"
+echo "✅ [完成] V13.14.1 部署完成，请强制刷新浏览器体验新分类功能！"
