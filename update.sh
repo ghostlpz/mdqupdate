@@ -2,20 +2,20 @@
 # VERSION = 13.7.0
 
 # ---------------------------------------------------------
-# Madou-Omni 在线升级脚本
+# Madou-Omni 在线升级脚本 (Docker 容器版)
 # 版本: V13.7.0
-# 更新内容: 新增 xChina (小黄书) 采集源, 适配 Flaresolverr, UI 多源选择
 # ---------------------------------------------------------
 
-echo "🚀 [Update] 检测到新版本 V13.7.0，开始执行热更新..."
+echo "🚀 [Update] 开始执行容器内热更新 (V13.7.0)..."
 
-# 1. 更新 package.json (持久化版本号)
-echo "📝 [1/6] 更新版本号至 package.json..."
-sed -i 's/"version": "13.6.0"/"version": "13.7.0"/' app/package.json
+# 1. 更新 package.json
+# 注意：容器内直接操作 package.json，不需要 app/ 前缀
+echo "📝 [1/6] 更新版本号..."
+sed -i 's/"version": "13.6.0"/"version": "13.7.0"/' package.json
 
-# 2. 更新 app/modules/resource_mgr.js
-echo "📝 [2/6] 升级资源管理器 (支持详细状态返回)..."
-cat > app/modules/resource_mgr.js << 'EOF'
+# 2. 更新 modules/resource_mgr.js
+echo "📝 [2/6] 升级资源管理器..."
+cat > modules/resource_mgr.js << 'EOF'
 const { pool } = require('./db');
 
 function hexToBase32(hex) {
@@ -106,9 +106,9 @@ const ResourceMgr = {
 module.exports = ResourceMgr;
 EOF
 
-# 3. 创建 app/modules/scraper_xchina.js
+# 3. 创建 modules/scraper_xchina.js
 echo "📝 [3/6] 部署 xChina 采集核心..."
-cat > app/modules/scraper_xchina.js << 'EOF'
+cat > modules/scraper_xchina.js << 'EOF'
 const axios = require('axios');
 const cheerio = require('cheerio');
 const ResourceMgr = require('./resource_mgr');
@@ -249,9 +249,9 @@ const ScraperXChina = {
 module.exports = ScraperXChina;
 EOF
 
-# 4. 更新 app/routes/api.js
+# 4. 更新 routes/api.js
 echo "📝 [4/6] 更新 API 路由逻辑..."
-cat > app/routes/api.js << 'EOF'
+cat > routes/api.js << 'EOF'
 const express = require('express');
 const axios = require('axios');
 const router = express.Router();
@@ -450,9 +450,9 @@ router.post('/system/online-update', async (req, res) => {
 module.exports = router;
 EOF
 
-# 5. 更新 app/public/index.html (含源选择器)
-echo "📝 [5/6] 刷新前端 UI 界面..."
-cat > app/public/index.html << 'EOF'
+# 5. 更新 public/index.html
+echo "📝 [5/6] 刷新前端 UI..."
+cat > public/index.html << 'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -789,9 +789,9 @@ cat > app/public/index.html << 'EOF'
 </html>
 EOF
 
-# 6. 更新 app/public/js/app.js (绑定新的启动逻辑)
-echo "📝 [6/6] 更新前端 JS 逻辑..."
-cat > app/public/js/app.js << 'EOF'
+# 6. 更新 public/js/app.js
+echo "📝 [6/6] 更新 JS 逻辑..."
+cat > public/js/app.js << 'EOF'
 let dbPage = 1;
 let qrTimer = null;
 
@@ -937,4 +937,7 @@ async function showQr() {
 }
 EOF
 
-echo "✅ [完成] 所有文件已就绪，系统将在脚本退出后自动重启。"
+# 7. 重启应用
+echo "🔄 重启应用以生效..."
+# 在容器内，我们直接 kill node 进程让 Docker 自动重启
+pkill -f "node app.js" || echo "尝试自动重启中..."
