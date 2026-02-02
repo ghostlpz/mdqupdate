@@ -1,19 +1,20 @@
 #!/bin/bash
-# VERSION = 13.13.4
+# VERSION = 13.13.5
 
 # ---------------------------------------------------------
 # Madou-Omni 在线升级脚本
-# 版本: V13.13.4
-# 修复: 刮削器死循环问题 (参考 renamer.js 修复 115 字段兼容性)
+# 版本: V13.13.5
+# 修复: 1. 刮削逻辑升级 (视频/文件夹 改名为 演员-标题)
+#       2. 海报改为"直传"模式，不占用115离线配额
 # ---------------------------------------------------------
 
-echo "🚀 [Update] 开始部署字段兼容修复版 (V13.13.4)..."
+echo "🚀 [Update] 开始部署完美刮削版 (V13.13.5)..."
 
 # 1. 更新 package.json
-sed -i 's/"version": ".*"/"version": "13.13.4"/' package.json
+sed -i 's/"version": ".*"/"version": "13.13.5"/' package.json
 
-# 2. 升级 login_115.js (增加字段清洗逻辑)
-echo "📝 [1/2] 升级 115 API (统一字段格式)..."
+# 2. 升级 login_115.js (增加直传功能)
+echo "📝 [1/2] 升级 115 API (支持直传)..."
 cat > modules/login_115.js << 'EOF'
 const axios = require('axios');
 const fs = require('fs');
@@ -93,48 +94,87 @@ const Login115 = {
         } catch (e) { return false; }
     },
 
-    // 🔥 核心升级：增加字段兼容性处理
     async getTaskByHash(hash) {
         if (!global.CONFIG.cookie115) return null;
         try {
             const cleanHash = hash.toLowerCase().trim();
-            // 扫描前 5 页 (增加扫描范围，防止任务被挤下去)
             for (let page = 1; page <= 5; page++) {
                 const url = `https://115.com/web/lixian/?ct=lixian&ac=task_lists&page=${page}`;
                 const res = await axios.get(url, { headers: this.getHeaders() });
-                
                 if (res.data && res.data.tasks) {
-                    const tasks = res.data.tasks;
-                    for (const task of tasks) {
-                        // 1. 匹配 Hash (兼容 info_hash 和 hash)
+                    for (const task of res.data.tasks) {
                         const tHash = task.info_hash || task.hash;
                         if (tHash === cleanHash) {
-                            // 2. 统一字段 (参考 renamer.js 逻辑)
-                            const normalizedTask = {
+                            return {
                                 ...task,
-                                // 统一文件ID
                                 folder_cid: task.file_id || task.cid || task.id,
-                                // 统一进度
                                 percent: (task.percent !== undefined) ? task.percent : (task.percentDone !== undefined ? task.percentDone : 0),
-                                // 统一状态
                                 status_code: (task.state !== undefined) ? task.state : (task.status !== undefined ? task.status : -1),
                                 name: task.name
                             };
-                            return normalizedTask;
                         }
                     }
                 }
             }
         } catch (e) { console.error("GetTaskErr:", e.message); }
         return null;
+    },
+
+    // 🔥 新增：文件直传 (不消耗离线配额)
+    async uploadFile(fileBuffer, fileName) {
+        try {
+            // 1. 获取上传参数
+            const infoRes = await axios.get('https://proapi.115.com/app/uploadinfo', { headers: this.getHeaders() });
+            if (!infoRes.data || !infoRes.data.state) throw new Error("获取上传信息失败");
+            const info = infoRes.data.data;
+
+            // 2. 构造表单 (使用 Node 20 原生 FormData)
+            const formData = new FormData();
+            formData.append('name', fileName);
+            formData.append('key', info.object + fileName);
+            formData.append('policy', info.policy);
+            formData.append('OSSAccessKeyId', info.accessid);
+            formData.append('success_action_status', '200');
+            formData.append('callback', info.callback);
+            formData.append('signature', info.signature);
+            // 构造 Blob
+            const blob = new Blob([fileBuffer]);
+            formData.append('file', blob, fileName);
+
+            // 3. 上传到阿里云 OSS
+            const uploadRes = await fetch(info.host, {
+                method: 'POST',
+                headers: { 'User-Agent': this.userAgent },
+                body: formData
+            });
+            const text = await uploadRes.text();
+            
+            // 4. 上传后文件通常在根目录(cid=0)，我们需要找到它并返回 file_id
+            if (text.includes('"state":true') || text.includes('"state": true')) {
+                // 稍微等待 115 索引
+                await new Promise(r => setTimeout(r, 2000));
+                // 搜索文件获取 ID (为了准确，搜索文件名)
+                const searchRes = await this.searchFile(fileName, 0);
+                if (searchRes.data && searchRes.data.length > 0) {
+                    // 找到最新创建的同名文件
+                    const file = searchRes.data.find(f => f.n === fileName);
+                    if (file) return file.fid;
+                }
+            }
+            return null;
+        } catch (e) {
+            console.error("Upload Failed:", e.message);
+            return null;
+        }
     }
 };
 module.exports = Login115;
 EOF
 
-# 3. 升级 organizer.js (使用统一后的字段)
-echo "📝 [2/2] 升级整理核心 (逻辑修正)..."
+# 3. 升级 organizer.js (完美重命名逻辑)
+echo "📝 [2/2] 升级整理核心 (命名规范化)..."
 cat > modules/organizer.js << 'EOF'
+const axios = require('axios'); // 需要 axios 下载图片
 const Login115 = require('./login_115');
 const ResourceMgr = require('./resource_mgr');
 
@@ -166,7 +206,6 @@ const Organizer = {
     run: async () => {
         if (IS_RUNNING || TASKS.length === 0) return;
         IS_RUNNING = true;
-
         while (TASKS.length > 0) {
             const item = TASKS[0];
             STATS.current = item.title;
@@ -177,9 +216,7 @@ const Organizer = {
                 if (success) STATS.success++; else STATS.fail++;
             } catch (e) {
                 log(`❌ 异常: ${item.title} - ${e.message}`, 'error');
-                TASKS.shift();
-                STATS.processed++;
-                STATS.fail++;
+                TASKS.shift(); STATS.processed++; STATS.fail++;
             }
             await new Promise(r => setTimeout(r, 2000));
         }
@@ -198,30 +235,16 @@ const Organizer = {
 
         log(`▶️ 处理: ${item.title.substring(0, 15)}...`);
 
+        // 1. 定位文件夹
         let folderCid = null;
         let retryCount = 0;
-        const maxRetries = 10; 
-
-        while (retryCount < maxRetries) {
-            // 获取清洗后的任务对象
+        while (retryCount < 12) {
             const task = await Login115.getTaskByHash(hash);
-            
             if (task) {
-                // 使用统一后的 status_code
-                if (task.status_code === 2) {
-                    folderCid = task.folder_cid;
-                    log(`✅ [115] 下载完成 (CID: ${folderCid})`);
-                    break;
-                } else if (task.status_code < 0) {
-                    log(`❌ [115] 任务失败/违规 (Code: ${task.status_code})`, 'error');
-                    return false;
-                } else {
-                    log(`⏳ [115] 下载中... ${task.percent.toFixed(2)}%`);
-                }
-            } else {
-                log(`⚠️ [115] 未找到任务，尝试搜索模式...`);
-                break;
-            }
+                if (task.status_code === 2) { folderCid = task.folder_cid; log(`✅ [115] 下载完成`); break; } 
+                else if (task.status_code < 0) { log(`❌ 任务失败/违规`, 'error'); return false; }
+                else { log(`⏳ 下载中... ${task.percent.toFixed(1)}%`); }
+            } else { break; } // 查不到可能已完成
             retryCount++;
             await new Promise(r => setTimeout(r, 5000)); 
         }
@@ -237,39 +260,80 @@ const Organizer = {
 
         if (!folderCid) { log(`❌ 无法定位文件夹`, 'error'); return false; }
 
+        // 2. 构造标准名称: "演员 - 标题"
+        let standardName = item.title;
+        if (item.actor && item.actor !== '未知演员') {
+            standardName = `${item.actor} - ${item.title}`;
+        }
+        // 去除非法字符
+        standardName = standardName.replace(/[\\/:*?"<>|]/g, " ").trim();
+
         try {
+            // 3. 处理文件夹内文件 (保留最大视频并重命名)
             const fileList = await Login115.getFileList(folderCid);
             if (fileList.data && fileList.data.length > 0) {
-                const files = fileList.data.filter(f => !f.fcid);
-                if (files.length > 1) {
+                const files = fileList.data.filter(f => !f.fcid); // 只看文件
+                if (files.length > 0) {
+                    // 按大小降序，取最大的作为主视频
                     files.sort((a, b) => b.s - a.s);
-                    const deleteIds = files.slice(1).map(f => f.fid).join(',');
-                    if (deleteIds) {
+                    const mainVideo = files[0];
+                    
+                    // 删除其他杂文件
+                    if (files.length > 1) {
+                        const deleteIds = files.slice(1).map(f => f.fid).join(',');
                         await Login115.deleteFiles(deleteIds);
-                        log(`🧹 清理杂文件: ${files.length - 1}个`);
+                        log(`🧹 清理杂文件: ${files.length - 1} 个`);
+                    }
+
+                    // 重命名主视频: 演员 - 标题.mp4
+                    const ext = mainVideo.n.lastIndexOf('.') > -1 ? mainVideo.n.substring(mainVideo.n.lastIndexOf('.')) : '';
+                    const newVideoName = standardName + ext;
+                    if (mainVideo.n !== newVideoName) {
+                        await Login115.rename(mainVideo.fid, newVideoName);
+                        log(`🎬 视频重命名: ${newVideoName}`);
                     }
                 }
             }
 
-            if (item.image_url) await Login115.addTask(item.image_url, folderCid);
+            // 4. 上传海报 (直传模式)
+            if (item.image_url) {
+                log(`🖼️ 正在下载并上传海报...`);
+                try {
+                    // 下载图片到内存
+                    const imgRes = await axios.get(item.image_url, { responseType: 'arraybuffer', timeout: 10000 });
+                    if (imgRes.status === 200) {
+                        // 使用唯一临时名上传，防止 poster.jpg 冲突
+                        const tempName = `poster_${hash.substring(0,6)}.jpg`;
+                        const uploadedFid = await Login115.uploadFile(imgRes.data, tempName);
+                        
+                        if (uploadedFid) {
+                            // 移动到目标文件夹
+                            await Login115.move(uploadedFid, folderCid);
+                            // 改名为 poster.jpg
+                            await Login115.rename(uploadedFid, 'poster.jpg');
+                            log(`✅ 海报上传成功 (不占离线配额)`);
+                        } else {
+                            log(`⚠️ 海报上传失败 (接口未返回ID)`, 'warn');
+                        }
+                    }
+                } catch (imgErr) {
+                    log(`⚠️ 海报处理失败: ${imgErr.message}`, 'warn');
+                }
+            }
 
-            let newFolderName = item.title;
-            if (item.actor && item.actor !== '未知演员') newFolderName = `${item.actor} - ${item.title}`;
-            newFolderName = newFolderName.replace(/[\\/:*?"<>|]/g, " ").trim();
-            
-            // 重命名文件夹
-            await Login115.rename(folderCid, newFolderName);
-            
-            // 移动
+            // 5. 重命名文件夹 & 移动
+            await Login115.rename(folderCid, standardName);
             const moveRes = await Login115.move(folderCid, targetCid);
+            
             if (moveRes) {
-                log(`🚚 归档成功!`, 'success');
+                log(`🚚 归档成功: [${standardName}]`, 'success');
                 await ResourceMgr.markAsRenamedByTitle(item.title);
                 return true;
             } else {
                 log(`❌ 移动失败`, 'error');
                 return false;
             }
+
         } catch (err) {
             log(`⚠️ 整理异常: ${err.message}`, 'warn');
             return false;
@@ -283,4 +347,4 @@ EOF
 echo "🔄 重启应用以生效..."
 pkill -f "node app.js" || echo "应用可能未运行。"
 
-echo "✅ [完成] V13.13.4 部署完成！"
+echo "✅ [完成] 完美刮削版 V13.13.5 部署完成！"
