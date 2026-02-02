@@ -1,20 +1,20 @@
 #!/bin/bash
-# VERSION = 13.13.7
+# VERSION = 13.13.8
 
 # ---------------------------------------------------------
 # Madou-Omni 在线升级脚本
-# 版本: V13.13.7
-# 修复: 1. 适配 115 新版上传接口 (uplb.115.com)
-#       2. 换用 batch_rename 接口解决改名失败问题
+# 版本: V13.13.8
+# 修复: 1. 移除上传接口对 bucket 字段的强制校验
+#       2. 优化命名逻辑: 自动从标题提取演员 (大卫 - 标题)
 # ---------------------------------------------------------
 
-echo "🚀 [Update] 开始部署核心接口重构版 (V13.13.7)..."
+echo "🚀 [Update] 开始部署终极修正版 (V13.13.8)..."
 
 # 1. 更新 package.json
-sed -i 's/"version": ".*"/"version": "13.13.7"/' package.json
+sed -i 's/"version": ".*"/"version": "13.13.8"/' package.json
 
-# 2. 核心：重写 login_115.js (适配新接口)
-echo "📝 [1/2] 重写 115 底层接口..."
+# 2. 修复 login_115.js (移除 bucket 检查)
+echo "📝 [1/2] 修正上传校验逻辑..."
 cat > modules/login_115.js << 'EOF'
 const axios = require('axios');
 const fs = require('fs');
@@ -34,7 +34,6 @@ const Login115 = {
         };
     },
 
-    // 获取 UserID (上传接口必需)
     async getUserId() {
         if (this.cachedUserId) return this.cachedUserId;
         try {
@@ -69,28 +68,19 @@ const Login115 = {
 
     async searchFile(keyword, cid = 0) {
         try {
-            // 搜索接口有时需要更严格的编码
             const url = `https://webapi.115.com/files/search?offset=0&limit=100&search_value=${encodeURIComponent(keyword)}&cid=${cid}`;
             const res = await axios.get(url, { headers: this.getHeaders() });
             return res.data;
         } catch (e) { return { data: [] }; }
     },
 
-    // 🔥 修复：使用 batch_rename 接口，成功率更高
     async rename(fileId, newName) {
         try {
-            // 净化文件名
             const cleanName = newName.replace(/[\\/:*?"<>|]/g, "").trim();
-            // 构造 batch_rename 的参数: files_new_name[fileId]=newName
             const postData = `files_new_name[${fileId}]=${encodeURIComponent(cleanName)}`;
-            
             const res = await axios.post('https://webapi.115.com/files/batch_rename', postData, { headers: this.getHeaders() });
-            
-            if (res.data && res.data.state) {
-                return { success: true };
-            } else {
-                return { success: false, msg: res.data ? res.data.error : '未知错误' };
-            }
+            if (res.data && res.data.state) return { success: true };
+            return { success: false, msg: res.data ? res.data.error : '未知错误' };
         } catch (e) { return { success: false, msg: e.message }; }
     },
 
@@ -148,27 +138,22 @@ const Login115 = {
         return null;
     },
 
-    // 🔥 核心升级：适配 uplb.115.com 新版上传接口
     async uploadFile(fileBuffer, fileName) {
         try {
-            // 0. 获取 UserID
             const userId = await this.getUserId();
-            if (!userId) throw new Error("无法获取UserID，请检查Cookie");
+            if (!userId) throw new Error("无法获取UserID");
 
-            // 1. 初始化上传 (sampleinitupload)
-            // target 通常是 U_1_0 (根目录)，这里我们先传到根目录，然后再移动
             const target = 'U_1_0'; 
             const initUrl = 'https://uplb.115.com/3.0/sampleinitupload.php';
             const initData = `userid=${userId}&filename=${encodeURIComponent(fileName)}&filesize=${fileBuffer.length}&target=${target}`;
             
             const initRes = await axios.post(initUrl, initData, { headers: this.getHeaders() });
-            
             if (!initRes.data) throw new Error("API无响应");
-            // 注意：这个接口有时返回 status:1 有时 state:true
+            
             const info = initRes.data; 
-            if (!info.bucket) throw new Error(`初始化失败: ${JSON.stringify(info)}`);
+            // 🔥 关键修改：不再检查 bucket，只检查核心参数
+            if (!info.object || !info.signature) throw new Error(`初始化失败: ${JSON.stringify(info)}`);
 
-            // 2. 构造 OSS 表单
             const formData = new FormData();
             formData.append('name', fileName);
             formData.append('key', info.object);
@@ -180,28 +165,19 @@ const Login115 = {
             const blob = new Blob([fileBuffer]);
             formData.append('file', blob, fileName);
 
-            // 3. 上传到阿里云 OSS
-            // 注意：host 可能是 http，需要转为 https 避免 mixed content (如果是后端则无所谓)
             const uploadRes = await fetch(info.host, {
                 method: 'POST',
-                headers: { 
-                    'User-Agent': this.userAgent
-                    // Fetch 会自动设置 multipart/form-data 的 boundary
-                },
+                headers: { 'User-Agent': this.userAgent },
                 body: formData
             });
             
             if (!uploadRes.ok) throw new Error(`OSS响应错误: ${uploadRes.status}`);
-            
             const text = await uploadRes.text();
             
-            // 4. 验证结果
             if (text.includes('"state":true') || text.includes('"state": true')) {
-                // 成功后，文件在根目录，需要搜索出来返回 ID
-                await new Promise(r => setTimeout(r, 2000)); // 等待索引
+                await new Promise(r => setTimeout(r, 2000));
                 const searchRes = await this.searchFile(fileName, 0);
                 if (searchRes.data && searchRes.data.length > 0) {
-                    // 找最新的
                     const file = searchRes.data.find(f => f.n === fileName);
                     if (file) return file.fid;
                 }
@@ -209,15 +185,15 @@ const Login115 = {
             return null;
         } catch (e) {
             console.error("[Login115] Upload Error:", e.message);
-            throw e; // 抛出异常触发降级
+            throw e;
         }
     }
 };
 module.exports = Login115;
 EOF
 
-# 3. 升级 organizer.js (逻辑微调)
-echo "📝 [2/2] 升级整理核心 (配合新接口)..."
+# 3. 修复 organizer.js (增强命名逻辑)
+echo "📝 [2/2] 优化命名提取..."
 cat > modules/organizer.js << 'EOF'
 const axios = require('axios');
 const Login115 = require('./login_115');
@@ -261,7 +237,9 @@ const Organizer = {
                 if (success) STATS.success++; else STATS.fail++;
             } catch (e) {
                 log(`❌ 异常: ${item.title} - ${e.message}`, 'error');
-                TASKS.shift(); STATS.processed++; STATS.fail++;
+                TASKS.shift();
+                STATS.processed++;
+                STATS.fail++;
             }
             await new Promise(r => setTimeout(r, 2000));
         }
@@ -283,11 +261,10 @@ const Organizer = {
         // 1. 定位
         let folderCid = null;
         let retryCount = 0;
-        // 稍微缩短等待时间，因为大部分是已完成任务
         while (retryCount < 8) {
             const task = await Login115.getTaskByHash(hash);
             if (task) {
-                if (task.status_code === 2) { folderCid = task.folder_cid; log(`✅ [115] 下载完成 (CID: ${folderCid})`); break; } 
+                if (task.status_code === 2) { folderCid = task.folder_cid; log(`✅ [115] 下载完成`); break; } 
                 else if (task.status_code < 0) { log(`❌ 任务失败/违规`, 'error'); return false; }
                 else { log(`⏳ 下载中... ${task.percent.toFixed(1)}%`); }
             } else { break; }
@@ -306,12 +283,27 @@ const Organizer = {
 
         if (!folderCid) { log(`❌ 无法定位文件夹`, 'error'); return false; }
 
-        // 2. 构造名称
-        let standardName = item.title;
-        if (item.actor && item.actor !== '未知演员') standardName = `${item.actor} - ${item.title}`;
-        // 清洗文件名，去除 Emoji 和特殊符号
+        // 🔥 2. 智能构造名称: "演员 - 标题"
+        let actor = item.actor;
+        let title = item.title;
+
+        // 如果数据库没演员，尝试从标题提取: "Title (Actor)"
+        if (!actor || actor === '未知演员') {
+            // 匹配中文或英文括号里的内容
+            const match = title.match(/^(.*?)\s*[（(](.*)[）)]$/);
+            if (match) {
+                title = match[1].trim(); // 提取纯标题
+                actor = match[2].trim(); // 提取括号里的演员
+            }
+        }
+
+        let standardName = title;
+        if (actor && actor !== '未知演员') {
+            standardName = `${actor} - ${title}`;
+        }
+        
+        // 净化文件名
         standardName = standardName.replace(/[\\/:*?"<>|]/g, "").replace(/\s+/g, ' ').trim();
-        // 截断长度防止报错
         if(standardName.length > 200) standardName = standardName.substring(0, 200);
 
         try {
@@ -341,39 +333,30 @@ const Organizer = {
 
             // 4. 海报
             if (item.image_url) {
-                log(`🖼️ 正在处理海报...`);
                 try {
                     const imgRes = await axios.get(item.image_url, { responseType: 'arraybuffer', timeout: 10000 });
                     if (imgRes.status === 200) {
                         const tempName = `poster_${hash.substring(0,6)}.jpg`;
-                        // 尝试直传
                         const uploadedFid = await Login115.uploadFile(imgRes.data, tempName);
                         
                         if (uploadedFid) {
                             await Login115.move(uploadedFid, folderCid);
                             await Login115.rename(uploadedFid, 'poster.jpg');
-                            log(`✅ 海报直传成功 (零配额)`);
+                            log(`✅ 海报直传成功`);
                         } else {
                             throw new Error("直传未返回ID");
                         }
                     }
                 } catch (imgErr) {
-                    log(`⚠️ 直传失败 (${imgErr.message}) -> 降级`, 'warn');
+                    log(`⚠️ 直传失败 -> 降级离线`, 'warn');
                     await Login115.addTask(item.image_url, folderCid);
-                    log(`📥 已添加海报离线任务`);
                 }
             }
 
             // 5. 文件夹重命名
-            const folderRenRes = await Login115.rename(folderCid, standardName);
-            if (!folderRenRes.success) {
-                log(`⚠️ 文件夹改名失败: ${folderRenRes.msg}`, 'warn');
-            } else {
-                log(`📁 文件夹改名成功`);
-            }
-
-            // 移动
+            await Login115.rename(folderCid, standardName);
             const moveRes = await Login115.move(folderCid, targetCid);
+            
             if (moveRes) {
                 log(`🚚 归档成功!`, 'success');
                 await ResourceMgr.markAsRenamedByTitle(item.title);
@@ -396,4 +379,4 @@ EOF
 echo "🔄 重启应用以生效..."
 pkill -f "node app.js" || echo "应用可能未运行。"
 
-echo "✅ [完成] V13.13.7 部署完成！"
+echo "✅ [完成] V13.13.8 终极修正版部署完成！"
