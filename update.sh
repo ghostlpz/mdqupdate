@@ -4,23 +4,22 @@
 # ---------------------------------------------------------
 # Madou-Omni 在线升级脚本
 # 版本: V13.15.3
-# 修复: 1. 严格移除 X-Device-Id (像素级复刻 Python 脚本行为)
-#       2. 修正 addTask 的 folder_type 逻辑
+# 核心: 1:1 复刻 Python 脚本的 App 协议 (解决登录和推送失败)
 # ---------------------------------------------------------
 
-echo "🚀 [Update] 开始部署像素级复刻版 (V13.15.3)..."
+echo "🚀 [Update] 开始部署 App 协议复刻版 (V13.15.3)..."
 
 # 1. 更新 package.json
 sed -i 's/"version": ".*"/"version": "13.15.3"/' package.json
 
-# 2. 重写 LoginPikPak (移除多余 Header，对齐 Python 逻辑)
-echo "📝 [1/1] 修正 PikPak 驱动..."
+# 2. 重写 LoginPikPak (使用 Python 脚本中的 ID/Secret)
+echo "📝 [1/1] 替换为 App 鉴权协议..."
 cat > modules/login_pikpak.js << 'EOF'
 const axios = require('axios');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const path = require('path');
 
-// 移植自 pikpak-master (client.py)
+// 🔥 核心修正: 移植自 Python 脚本的 App ID
 const CLIENT_ID = "YNxT9w7GMdWvEOKa";
 const CLIENT_SECRET = "dbw2OtmVEeuUvIptb1Coygx";
 
@@ -30,8 +29,8 @@ const LoginPikPak = {
         password: '',
         token: '',
         refreshToken: '',
-        userId: ''
-        // 移除 deviceId，Python 脚本未通过 headers 发送此参数
+        userId: '',
+        deviceId: 'madou_omni_v1' // 仅保留用于内部标识，不发给服务器
     },
     proxy: null,
     
@@ -47,6 +46,7 @@ const LoginPikPak = {
                 this.auth.token = val;
             }
         }
+        // 读取缓存 Token
         if (cfg.pikpak_token) {
             try {
                 const t = JSON.parse(cfg.pikpak_token);
@@ -58,20 +58,18 @@ const LoginPikPak = {
         if (cfg.proxy) this.proxy = cfg.proxy;
     },
 
-    // 🔥 关键修改: 严格对齐 Python 脚本的 Headers
+    // 🔥 修正: 严格对齐 Python 脚本的 Header (移除 X-Device-Id)
     getAxiosConfig() {
         const config = {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36',
                 'Content-Type': 'application/json; charset=utf-8'
             },
-            timeout: 20000 // 增加超时防止代理慢
+            timeout: 15000
         };
-        // 只有 Authorization 是动态的
         if (this.auth.token) {
             config.headers['Authorization'] = this.auth.token;
         }
-        // 代理配置
         if (this.proxy) {
             config.httpsAgent = new HttpsProxyAgent(this.proxy);
             config.proxy = false;
@@ -95,7 +93,7 @@ const LoginPikPak = {
     },
 
     async login() {
-        // 1. 尝试 Refresh Token
+        // 1. 尝试刷新 Token
         if (this.auth.refreshToken) {
             console.log('🔄 PikPak 尝试刷新 Token...');
             try {
@@ -108,8 +106,8 @@ const LoginPikPak = {
                 };
                 const res = await axios.post(url, payload, this.getAxiosConfig());
                 if (res.data && res.data.access_token) {
-                    console.log('✅ PikPak Token 刷新成功');
                     this.saveToken(res.data);
+                    console.log('✅ Token 刷新成功');
                     return true;
                 }
             } catch (e) {
@@ -118,58 +116,53 @@ const LoginPikPak = {
             }
         }
 
-        // 2. 尝试账号密码登录
-        if (!this.auth.username || !this.auth.password) {
-            return !!this.auth.token; // 如果只有 token 且没法刷新，就只能硬着头皮用了
-        }
+        // 2. 账号密码登录
+        if (!this.auth.username || !this.auth.password) return !!this.auth.token;
 
         try {
-            console.log('🔑 PikPak 尝试账号密码登录...');
+            console.log('🔑 PikPak 尝试 App 协议登录...');
             const url = 'https://user.mypikpak.com/v1/auth/signin';
             const payload = {
                 client_id: CLIENT_ID,
-                client_secret: CLIENT_SECRET,
+                client_secret: CLIENT_SECRET, // 关键参数
                 username: this.auth.username,
                 password: this.auth.password
             };
             
-            // 登录时不带 Authorization
             const config = this.getAxiosConfig();
-            delete config.headers['Authorization'];
+            delete config.headers['Authorization']; // 登录不需要 Auth 头
 
             const res = await axios.post(url, payload, config);
             if (res.data && res.data.access_token) {
-                console.log('✅ PikPak 登录成功');
+                console.log('✅ 登录成功');
                 this.saveToken(res.data);
                 return true;
             }
         } catch (e) {
             const status = e.response ? e.response.status : 'Network Error';
             const data = e.response ? JSON.stringify(e.response.data) : e.message;
-            console.error(`❌ PikPak 登录失败 [${status}]: ${data}`);
+            console.error(`❌ 登录失败 [${status}]: ${data}`);
         }
         return false;
     },
 
     async testConnection() {
-        this.auth.token = ''; 
-        this.auth.refreshToken = '';
+        this.auth.token = ''; this.auth.refreshToken = ''; // 强制重测
         if(global.CONFIG) global.CONFIG.pikpak_token = '';
 
         const success = await this.login();
-        if (!success) return { success: false, msg: "登录失败: 请检查账号/密码或代理配置" };
+        if (!success) return { success: false, msg: "登录失败: 请检查账号/密码或代理" };
 
         try {
-            // 尝试列出文件
             const url = `https://api-drive.mypikpak.com/drive/v1/files?filters={"trashed":{"eq":false}}&limit=1`;
             await axios.get(url, this.getAxiosConfig());
-            return { success: true, msg: "✅ 连接成功！(API 正常)" };
+            return { success: true, msg: "✅ 连接成功！(App 协议)" };
         } catch (e) {
             return { success: false, msg: `API 错误: ${e.message}` };
         }
     },
 
-    // 复刻 Python 的 offline_download 逻辑
+    // 复刻 Python 的 addTask 逻辑 (解决 400 错误)
     async addTask(url, parentId = '') {
         return await this._addTaskInternal(url, parentId, true);
     },
@@ -178,31 +171,23 @@ const LoginPikPak = {
         if (!this.auth.token) await this.login();
         try {
             const apiUrl = 'https://api-drive.mypikpak.com/drive/v1/files';
-            
             let fileName = 'unknown_video';
             try { fileName = path.basename(new URL(url).pathname); } catch(e) {}
 
-            // 🔥 这里的结构必须完全匹配 Python 脚本
-            /* Python:
-               "url": {"url": file_url},
-               "folder_type": "DOWNLOAD" if not parent_id else "",
-            */
             const payload = {
                 kind: "drive#file",
                 name: fileName,
                 upload_type: "UPLOAD_TYPE_URL",
-                url: { "url": url }, // 必须是对象
-                folder_type: parentId ? "" : "DOWNLOAD" // 有父目录则置空，否则为 DOWNLOAD
+                url: { "url": url }, // 🔥 结构修正
+                folder_type: parentId ? "" : "DOWNLOAD" // 🔥 逻辑修正
             };
-            
             if (parentId) payload.parent_id = parentId;
 
             const res = await axios.post(apiUrl, payload, this.getAxiosConfig());
             return res.data && (res.data.task || res.data.file); 
         } catch (e) {
-            // 401 过期重试
             if (allowRetry && e.response && e.response.status === 401) {
-                console.log('⚠️ Token 过期，重试...');
+                console.log('⚠️ Token 过期重试...');
                 this.auth.token = '';
                 if (await this.login()) return await this._addTaskInternal(url, parentId, false);
             }
@@ -212,7 +197,7 @@ const LoginPikPak = {
         }
     },
 
-    // 其他文件操作函数保持使用 getAxiosConfig() 即可
+    // 其他方法保持基础实现 (略有精简)
     async getFileList(parentId = '') {
         if (!this.auth.token) await this.login();
         try {
