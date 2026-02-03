@@ -1,275 +1,273 @@
 #!/bin/bash
-# VERSION = 13.15.0
+# VERSION = 13.15.1
 
 # ---------------------------------------------------------
 # Madou-Omni 在线升级脚本
-# 版本: V13.15.0
-# 优化: 1. 界面体验 (配置整合/说明文案/移除扫码)
-#       2. 新增 "推送+刮削" 联动按钮
-#       3. 修复停止按钮无日志反馈的问题
+# 版本: V13.15.1
+# 修复: PikPak 登录支持直接填入 Token (解决账号密码登录失败问题)
 # ---------------------------------------------------------
 
-echo "🚀 [Update] 开始部署体验优化版 (V13.15.0)..."
+echo "🚀 [Update] 开始部署 Token 直连版 (V13.15.1)..."
 
 # 1. 更新 package.json
-sed -i 's/"version": ".*"/"version": "13.15.0"/' package.json
+sed -i 's/"version": ".*"/"version": "13.15.1"/' package.json
 
-# 2. 优化 Scraper (增加停止日志)
-echo "📝 [1/3] 优化采集器交互..."
-# 我们微调 scraper_xchina.js 的 stop 方法
-sed -i "s/stop: () => { STATE.stopSignal = true; }/stop: () => { STATE.stopSignal = true; log('🛑 用户已点击停止，正在结束当前任务...', 'warn'); }/" modules/scraper_xchina.js
-
-# 3. 重构 API (支持 推送+刮削 联动)
-echo "📝 [2/3] 升级后端接口 (支持混合推送)..."
-cat > routes/api.js << 'EOF'
-const express = require('express');
+# 2. 升级 LoginPikPak (支持 Token 识别)
+echo "📝 [1/2] 升级 PikPak 驱动 (支持 Token)..."
+cat > modules/login_pikpak.js << 'EOF'
 const axios = require('axios');
-const router = express.Router();
-const fs = require('fs');
-const { exec } = require('child_process');
 const { HttpsProxyAgent } = require('https-proxy-agent');
-const { Parser } = require('json2csv');
-const Scraper = require('../modules/scraper');
-const ScraperXChina = require('../modules/scraper_xchina');
-const Renamer = require('../modules/renamer');
-const Organizer = require('../modules/organizer');
-const Login115 = require('../modules/login_115');
-const LoginPikPak = require('../modules/login_pikpak');
-const ResourceMgr = require('../modules/resource_mgr');
-const AUTH_PASSWORD = process.env.AUTH_PASSWORD || "admin888";
+const path = require('path');
 
-function compareVersions(v1, v2) {
-    if (!v1 || !v2) return 0;
-    const p1 = v1.split('.').map(Number);
-    const p2 = v2.split('.').map(Number);
-    for (let i = 0; i < Math.max(p1.length, p2.length); i++) {
-        const n1 = p1[i] || 0;
-        const n2 = p2[i] || 0;
-        if (n1 > n2) return 1;
-        if (n1 < n2) return -1;
-    }
-    return 0;
-}
-
-router.get('/check-auth', (req, res) => {
-    const auth = req.headers['authorization'];
-    res.json({ authenticated: auth === AUTH_PASSWORD });
-});
-router.post('/login', (req, res) => {
-    if (req.body.password === AUTH_PASSWORD) res.json({ success: true });
-    else res.json({ success: false, msg: "密码错误" });
-});
-router.post('/config', (req, res) => {
-    global.CONFIG = { ...global.CONFIG, ...req.body };
-    global.saveConfig();
-    if(LoginPikPak.setConfig) LoginPikPak.setConfig(global.CONFIG);
-    res.json({ success: true });
-});
-router.get('/status', (req, res) => {
-    let logs = Scraper.getState().logs;
-    let scraped = Scraper.getState().totalScraped;
-    if (ScraperXChina.getState().isRunning) {
-        logs = ScraperXChina.getState().logs;
-        scraped = ScraperXChina.getState().totalScraped;
-    }
-    const orgState = Organizer.getState();
-    res.json({ 
-        config: global.CONFIG, 
-        state: { isRunning: Scraper.getState().isRunning || ScraperXChina.getState().isRunning, logs, totalScraped: scraped }, 
-        renamerState: Renamer.getState(),
-        organizerLogs: orgState.logs, 
-        organizerStats: orgState.stats,
-        version: global.CURRENT_VERSION 
-    });
-});
-router.get('/categories', (req, res) => {
-    res.json({ categories: ScraperXChina.getCategories() });
-});
-
-router.get('/115/check', async (req, res) => {
-    const { uid, time, sign } = req.query;
-    const result = await Login115.checkStatus(uid, time, sign);
-    if (result.success && result.cookie) {
-        global.CONFIG.cookie115 = result.cookie;
-        global.saveConfig();
-        res.json({ success: true, msg: "登录成功", cookie: result.cookie });
-    } else { res.json(result); }
-});
-
-router.get('/pikpak/check', async (req, res) => {
-    try {
-        LoginPikPak.setConfig(global.CONFIG);
-        const result = await LoginPikPak.testConnection();
-        res.json(result);
-    } catch (e) { res.json({ success: false, msg: e.message }); }
-});
-
-router.post('/start', (req, res) => {
-    const autoDl = req.body.autoDownload === true;
-    const type = req.body.type; 
-    const source = req.body.source || 'madou';
-    const categories = req.body.categories || []; 
-
-    if (Scraper.getState().isRunning || ScraperXChina.getState().isRunning) {
-        return res.json({ success: false, msg: "已有任务正在运行" });
-    }
-
-    if (source === 'xchina') {
-        ScraperXChina.clearLogs();
-        ScraperXChina.start(type, autoDl, categories);
-    } else {
-        const pages = type === 'full' ? 50000 : 100;
-        Scraper.clearLogs();
-        Scraper.start(pages, "手动", autoDl);
-    }
-    res.json({ success: true });
-});
-router.post('/stop', (req, res) => {
-    Scraper.stop();
-    ScraperXChina.stop();
-    Renamer.stop();
-    res.json({ success: true });
-});
-
-// 🔥 重构: 智能推送接口 (支持 115/PikPak 混合 + 自动刮削)
-router.post('/push', async (req, res) => {
-    const ids = req.body.ids || [];
-    const autoOrganize = req.body.organize === true;
-
-    if (ids.length === 0) return res.json({ success: false, msg: "未选择任务" });
+const LoginPikPak = {
+    auth: {
+        username: '',
+        password: '',
+        token: '',
+        userId: '',
+        deviceId: 'madou_omni_v1'
+    },
+    proxy: null,
     
-    let successCount = 0;
-    try {
-        const items = await ResourceMgr.getByIds(ids);
+    setConfig(cfg) {
+        if (!cfg) return;
         
-        for (const item of items) {
-            let pushed = false;
-            let magnet = item.magnets || '';
-            
-            // 识别驱动
-            if (magnet.startsWith('pikpak|')) {
-                const realLink = magnet.replace('pikpak|', '');
-                // PikPak 推送
-                const task = await LoginPikPak.addTask(realLink);
-                pushed = !!task;
+        // 1. 设置账号/Token
+        if (cfg.pikpak) {
+            const val = cfg.pikpak.trim();
+            if (val.includes('|')) {
+                // 模式A: 账号|密码
+                const parts = val.split('|');
+                this.auth.username = parts[0].trim();
+                this.auth.password = parts[1].trim();
+                this.auth.token = ''; // 清空旧 Token，强制重登
             } else {
-                // 115 推送
-                if (!global.CONFIG.cookie115) { continue; }
-                pushed = await Login115.addTask(magnet);
+                // 模式B: 直接 Token
+                // 自动补全 Bearer
+                this.auth.token = val.startsWith('Bearer') ? val : 'Bearer ' + val;
+                this.auth.username = '';
+                this.auth.password = '';
+            }
+        }
+        
+        // 2. 设置代理
+        if (cfg.proxy) this.proxy = cfg.proxy;
+    },
+
+    getAxiosConfig() {
+        const config = {
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Device-Id': this.auth.deviceId,
+                'Authorization': this.auth.token || ''
+            },
+            timeout: 10000
+        };
+        if (this.proxy) {
+            config.httpsAgent = new HttpsProxyAgent(this.proxy);
+            config.proxy = false;
+        }
+        return config;
+    },
+
+    async login() {
+        // 如果已经有 Token (用户填写的)，直接验证有效性即可，视为登录成功
+        if (this.auth.token && !this.auth.username) return true;
+        
+        // 否则尝试用账号密码换 Token
+        if (!this.auth.username || !this.auth.password) return false;
+
+        try {
+            const url = 'https://user.mypikpak.com/v1/auth/signin';
+            const payload = {
+                client_id: "YNxT9w7GMvwD3",
+                username: this.auth.username,
+                password: this.auth.password
+            };
+            const config = { 
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 10000
+            };
+            if (this.proxy) {
+                config.httpsAgent = new HttpsProxyAgent(this.proxy);
+                config.proxy = false;
             }
 
-            if (pushed) {
-                successCount++;
-                await ResourceMgr.markAsPushed(item.id);
-                // 联动刮削
-                if (autoOrganize) {
-                    Organizer.addTask(item);
+            const res = await axios.post(url, payload, config);
+            if (res.data && res.data.access_token) {
+                this.auth.token = 'Bearer ' + res.data.access_token;
+                this.auth.userId = res.data.sub;
+                console.log('✅ PikPak 登录成功 (账号模式)');
+                return true;
+            }
+        } catch (e) {
+            const msg = e.response ? `HTTP ${e.response.status}` : e.message;
+            console.error(`❌ PikPak 登录失败 (${msg})`);
+        }
+        return false;
+    },
+
+    // 🧪 测试连接
+    async testConnection() {
+        // 尝试登录 (如果是 Token 模式，这里直接返回 true)
+        const loginSuccess = await this.login();
+        if (!loginSuccess && !this.auth.token) return { success: false, msg: "登录失败: 请检查账号密码或代理" };
+
+        try {
+            // 尝试列出文件来验证 Token 有效性
+            const url = `https://api-drive.mypikpak.com/drive/v1/files?filters={"trashed":{"eq":false}}&limit=1`;
+            await axios.get(url, this.getAxiosConfig());
+            return { success: true, msg: "✅ PikPak 连接成功！(Token 有效)" };
+        } catch (e) {
+            if (e.response && e.response.status === 401) {
+                return { success: false, msg: "❌ Token 已过期或无效，请重新提取" };
+            }
+            return { success: false, msg: `API 访问错误: ${e.message}` };
+        }
+    },
+
+    async addTask(url, parentId = '') {
+        if (!this.auth.token) await this.login();
+        try {
+            const apiUrl = 'https://api-drive.mypikpak.com/drive/v1/files';
+            
+            let fileName = 'unknown_video';
+            try { fileName = path.basename(new URL(url).pathname); } catch(e) {}
+
+            const payload = {
+                kind: "drive#file",
+                upload_type: "UPLOAD_TYPE_URL",
+                url: url,
+                name: fileName,
+                folder_type: "DOWNLOAD"
+            };
+            
+            if (parentId && parentId.trim() !== '') {
+                payload.parent_id = parentId;
+            }
+
+            const res = await axios.post(apiUrl, payload, this.getAxiosConfig());
+            return res.data && (res.data.task || res.data.file); 
+        } catch (e) {
+            const errMsg = e.response ? `Status ${e.response.status}: ${JSON.stringify(e.response.data)}` : e.message;
+            console.error('PikPak AddTask Error:', errMsg);
+            return false;
+        }
+    },
+
+    async getFileList(parentId = '') {
+        if (!this.auth.token) await this.login();
+        try {
+            let url = `https://api-drive.mypikpak.com/drive/v1/files?filters={"trashed":{"eq":false}}&limit=100`;
+            if (parentId) url += `&parent_id=${parentId}`;
+            
+            const res = await axios.get(url, this.getAxiosConfig());
+            if (res.data && res.data.files) {
+                const list = res.data.files.map(f => ({
+                    fid: f.id,
+                    n: f.name,
+                    s: parseInt(f.size || 0),
+                    fcid: f.kind === 'drive#folder' ? f.id : undefined,
+                    parent_id: f.parent_id
+                }));
+                return { data: list };
+            }
+        } catch (e) { console.error(e.message); }
+        return { data: [] };
+    },
+
+    async searchFile(keyword, parentId = '') {
+        if (!this.auth.token) await this.login();
+        try {
+            const list = await this.getFileList(parentId);
+            const matches = list.data.filter(f => f.n.includes(keyword));
+            return { data: matches };
+        } catch (e) { return { data: [] }; }
+    },
+
+    async rename(fileId, newName) {
+        if (!this.auth.token) await this.login();
+        try {
+            const url = `https://api-drive.mypikpak.com/drive/v1/files/${fileId}`;
+            const payload = { name: newName };
+            const res = await axios.patch(url, payload, this.getAxiosConfig());
+            return { success: !!res.data.id };
+        } catch (e) { return { success: false, msg: e.message }; }
+    },
+
+    async move(fileIds, targetCid) {
+        if (!this.auth.token) await this.login();
+        try {
+            const url = 'https://api-drive.mypikpak.com/drive/v1/files/batch_move';
+            const ids = fileIds.split(',');
+            const payload = { ids: ids, to: { parent_id: targetCid } };
+            const res = await axios.post(url, payload, this.getAxiosConfig());
+            return true;
+        } catch (e) { return false; }
+    },
+
+    async deleteFiles(fileIds) {
+        if (!this.auth.token) await this.login();
+        try {
+            const url = 'https://api-drive.mypikpak.com/drive/v1/files/batch_trash';
+            const ids = fileIds.split(',');
+            const payload = { ids: ids };
+            await axios.post(url, payload, this.getAxiosConfig());
+            return true;
+        } catch (e) { return false; }
+    },
+
+    async getTaskByHash(hashOrUrl, nameHint = '') {
+        if (!this.auth.token) await this.login();
+        try {
+            if (nameHint) {
+                const searchRes = await this.searchFile(nameHint.substring(0, 10));
+                if (searchRes.data && searchRes.data.length > 0) {
+                    const f = searchRes.data[0];
+                    return {
+                        status_code: 2,
+                        folder_cid: f.fcid ? f.fid : f.parent_id,
+                        file_id: f.fid,
+                        percent: 100
+                    };
                 }
             }
-            await new Promise(r => setTimeout(r, 200));
-        }
-        res.json({ 
-            success: true, 
-            count: successCount, 
-            msg: autoOrganize ? "已推送并加入刮削队列" : "推送完成" 
-        });
-    } catch (e) { res.json({ success: false, msg: e.message }); }
-});
+        } catch (e) {}
+        return null;
+    },
 
-router.post('/organize', async (req, res) => {
-    const ids = req.body.ids || [];
-    if (ids.length === 0) return res.json({ success: false, msg: "未选择任务" });
+    async uploadFile(fileBuffer, fileName, parentId = '') {
+        if (!this.auth.token) await this.login();
+        try {
+            const createUrl = 'https://api-drive.mypikpak.com/drive/v1/files';
+            const createPayload = {
+                kind: "drive#file",
+                name: fileName,
+                upload_type: "UPLOAD_TYPE_RESUMABLE"
+            };
+            if (parentId) createPayload.parent_id = parentId;
 
-    try {
-        const items = await ResourceMgr.getByIds(ids);
-        let count = 0;
-        items.forEach(item => {
-            Organizer.addTask(item);
-            count++;
-        });
-        res.json({ success: true, count: count, msg: "已加入后台刮削队列" });
-    } catch (e) { res.json({ success: false, msg: e.message }); }
-});
+            const res1 = await axios.post(createUrl, createPayload, this.getAxiosConfig());
+            const uploadUrl = res1.data.upload_url;
+            const fileId = res1.data.file.id;
 
-router.post('/delete', async (req, res) => {
-    const ids = req.body.ids || [];
-    if (ids.length === 0) return res.json({ success: false, msg: "未选择删除项" });
-    const result = await ResourceMgr.deleteByIds(ids);
-    if (result.success) res.json({ success: true, count: result.count });
-    else res.json({ success: false, msg: "删除失败: " + result.error });
-});
-router.get('/data', async (req, res) => {
-    const filters = { pushed: req.query.pushed || '', renamed: req.query.renamed || '' };
-    const result = await ResourceMgr.getList(parseInt(req.query.page) || 1, 100, filters);
-    res.json(result);
-});
-router.get('/export', async (req, res) => {
-    try {
-        const type = req.query.type || 'page';
-        let data = [];
-        if (type === 'all') data = await ResourceMgr.getAllForExport();
-        else {
-            const result = await ResourceMgr.getList(parseInt(req.query.page) || 1, 100);
-            data = result.data;
-        }
-        const parser = new Parser({ fields: ['id', 'code', 'title', 'magnets', 'created_at'] });
-        const csv = parser.parse(data);
-        res.header('Content-Type', 'text/csv');
-        res.attachment(`madou_${Date.now()}.csv`);
-        return res.send(csv);
-    } catch (err) { res.status(500).send("Err: " + err.message); }
-});
-router.post('/system/online-update', async (req, res) => {
-    const updateUrl = global.UPDATE_URL;
-    const options = { timeout: 30000 };
-    if (global.CONFIG.proxy && global.CONFIG.proxy.startsWith('http')) {
-        const agent = new HttpsProxyAgent(global.CONFIG.proxy);
-        options.httpAgent = agent;
-        options.httpsAgent = agent;
+            if (uploadUrl) {
+                const putConfig = this.getAxiosConfig();
+                putConfig.headers['Content-Type'] = ''; 
+                await axios.put(uploadUrl, fileBuffer, putConfig);
+                return fileId;
+            }
+        } catch (e) { console.error('PP Upload Err:', e.message); }
+        return null;
     }
-    const tempScriptPath = '/data/update_temp.sh';
-    const finalScriptPath = '/data/update.sh';
-    try {
-        console.log(`⬇️ 正在检查更新: ${updateUrl}`);
-        const response = await axios({ method: 'get', url: updateUrl, ...options, responseType: 'stream' });
-        const writer = fs.createWriteStream(tempScriptPath);
-        response.data.pipe(writer);
-        writer.on('finish', () => {
-            fs.readFile(tempScriptPath, 'utf8', (err, data) => {
-                if (err) return res.json({ success: false, msg: "无法读取下载的脚本" });
-                const match = data.match(/#\s*VERSION\s*=\s*([0-9\.]+)/);
-                const remoteVersion = match ? match[1] : null;
-                const localVersion = global.CURRENT_VERSION;
-                if (!remoteVersion) return res.json({ success: false, msg: "远程脚本未包含版本号信息" });
-                console.log(`🔍 版本对比: 本地[${localVersion}] vs 云端[${remoteVersion}]`);
-                if (compareVersions(remoteVersion, localVersion) > 0) {
-                    fs.renameSync(tempScriptPath, finalScriptPath);
-                    res.json({ success: true, msg: `发现新版本 V${remoteVersion}，正在升级...` });
-                    setTimeout(() => {
-                        exec(`chmod +x ${finalScriptPath} && sh ${finalScriptPath}`, (error, stdout, stderr) => {
-                            if (error) console.error(`❌ 升级失败: ${error.message}`);
-                            else {
-                                console.log(`✅ 升级日志:\n${stdout}`);
-                                fs.renameSync(finalScriptPath, finalScriptPath + '.bak');
-                                console.log("🔄 重启容器...");
-                                process.exit(0);
-                            }
-                        });
-                    }, 1000);
-                } else {
-                    fs.unlinkSync(tempScriptPath);
-                    res.json({ success: false, msg: `当前已是最新版本 (V${localVersion})` });
-                }
-            });
-        });
-        writer.on('error', (err) => { res.json({ success: false, msg: "文件写入失败" }); });
-    } catch (e) { res.json({ success: false, msg: "连接失败: " + e.message }); }
-});
-module.exports = router;
+};
+
+if(global.CONFIG) LoginPikPak.setConfig(global.CONFIG);
+module.exports = LoginPikPak;
 EOF
 
-# 4. 重写前端 (UI 优化 + 配置搬家)
-echo "📝 [3/3] 升级前端界面 (UI 优化)..."
+# 3. 更新 UI (更新标签说明)
+echo "📝 [2/2] 升级前端界面..."
 cat > public/index.html << 'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -405,12 +403,12 @@ cat > public/index.html << 'EOF'
                 </div>
                 <hr style="border:0;border-top:1px solid var(--border);margin:20px 0">
                 <div class="input-group">
-                    <label>PikPak 账号 (用户名|密码)</label>
+                    <label>PikPak 账号 / Token</label>
                     <div style="display:flex;gap:10px">
-                        <input id="cfg-pikpak" placeholder="username|password" style="flex:1">
+                        <input id="cfg-pikpak" placeholder="账号|密码 或 Bearer Token" style="flex:1">
                         <button class="btn btn-info" onclick="checkPikPak()">🧪 测试连接</button>
                     </div>
-                    <div class="desc">PikPak 账号密码 (username|password)，用于 M3U8 视频离线</div>
+                    <div class="desc">建议直接填入 Token (Bearer xxxx)，因为账号密码登录易受验证码拦截</div>
                 </div>
                 <div class="input-group">
                     <label>目标目录 CID</label>
@@ -487,212 +485,8 @@ cat > public/index.html << 'EOF'
 </html>
 EOF
 
-# 5. 更新前端逻辑 (适配新 API)
-echo "📝 [4/4] 升级前端逻辑..."
-cat > public/js/app.js << 'EOF'
-let dbPage = 1;
-
-async function request(endpoint, options = {}) {
-    const token = localStorage.getItem('token');
-    const headers = { 'Content-Type': 'application/json' };
-    if (token) headers['Authorization'] = token;
-    try {
-        const res = await fetch('/api/' + endpoint, { ...options, headers: { ...headers, ...options.headers } });
-        if (res.status === 401) {
-            localStorage.removeItem('token');
-            document.getElementById('lock').classList.remove('hidden');
-            throw new Error("未登录");
-        }
-        return await res.json();
-    } catch (e) { console.error(e); return { success: false, msg: e.message }; }
-}
-
-async function login() {
-    const p = document.getElementById('pass').value;
-    const res = await fetch('/api/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: p}) });
-    const data = await res.json();
-    if (data.success) { localStorage.setItem('token', p); document.getElementById('lock').classList.add('hidden'); } else { alert("密码错误"); }
-}
-
-window.onload = async () => {
-    const res = await request('check-auth');
-    if (res.authenticated) document.getElementById('lock').classList.add('hidden');
-    document.getElementById('pass').addEventListener('keypress', e => { if(e.key === 'Enter') login(); });
-    
-    // 初始化配置回显
-    const r = await request('status');
-    if(r.config) {
-        if(document.getElementById('cfg-proxy')) document.getElementById('cfg-proxy').value = r.config.proxy || '';
-        if(document.getElementById('cfg-cookie')) document.getElementById('cfg-cookie').value = r.config.cookie115 || '';
-        if(document.getElementById('cfg-flare')) document.getElementById('cfg-flare').value = r.config.flaresolverrUrl || '';
-        if(document.getElementById('cfg-target-cid')) document.getElementById('cfg-target-cid').value = r.config.targetCid || '';
-        if(document.getElementById('cfg-pikpak')) document.getElementById('cfg-pikpak').value = r.config.pikpak || '';
-    }
-    if(r.version && document.getElementById('cur-ver')) document.getElementById('cur-ver').innerText = "V" + r.version;
-};
-
-function show(id) {
-    document.querySelectorAll('.page').forEach(e => e.classList.add('hidden'));
-    document.getElementById(id).classList.remove('hidden');
-    document.querySelectorAll('.nav-item').forEach(e => e.classList.remove('active'));
-    if(event && event.target) event.target.closest('.nav-item').classList.add('active');
-    if(id === 'database') loadDb(1);
-    // 刷新配置
-    if(id === 'settings') {
-        setTimeout(async () => {
-            const r = await request('status');
-            if(r.config) {
-                if(document.getElementById('cfg-proxy')) document.getElementById('cfg-proxy').value = r.config.proxy || '';
-                if(document.getElementById('cfg-cookie')) document.getElementById('cfg-cookie').value = r.config.cookie115 || '';
-                if(document.getElementById('cfg-flare')) document.getElementById('cfg-flare').value = r.config.flaresolverrUrl || '';
-                if(document.getElementById('cfg-target-cid')) document.getElementById('cfg-target-cid').value = r.config.targetCid || '';
-                if(document.getElementById('cfg-pikpak')) document.getElementById('cfg-pikpak').value = r.config.pikpak || '';
-            }
-        }, 100);
-    }
-}
-
-function getDlState() { return document.getElementById('auto-dl').checked; }
-
-async function api(act, body={}) { 
-    const res = await request(act, { method: 'POST', body: JSON.stringify(body) }); 
-    if(!res.success && res.msg) alert("❌ " + res.msg);
-    if(res.success && act === 'start') alert("✅ 任务已启动");
-}
-
-async function runOnlineUpdate() {
-    const btn = event.target; const oldTxt = btn.innerText; btn.innerText = "⏳ 检查中..."; btn.disabled = true;
-    try {
-        const res = await request('system/online-update', { method: 'POST' });
-        if(res.success) { alert("🚀 " + res.msg); setTimeout(() => location.reload(), 15000); } 
-        else { alert("❌ " + res.msg); }
-    } catch(e) { alert("请求失败"); }
-    btn.innerText = oldTxt; btn.disabled = false;
-}
-
-async function saveCfg() {
-    const proxy = document.getElementById('cfg-proxy').value;
-    const cookie115 = document.getElementById('cfg-cookie').value;
-    const flaresolverrUrl = document.getElementById('cfg-flare').value;
-    const targetCid = document.getElementById('cfg-target-cid').value;
-    const pikpak = document.getElementById('cfg-pikpak').value;
-    
-    const body = { proxy, cookie115, flaresolverrUrl, targetCid, pikpak };
-    await request('config', { method: 'POST', body: JSON.stringify(body) });
-    alert('✅ 配置已保存');
-}
-
-function toggleAll(source) { const checkboxes = document.querySelectorAll('.row-chk'); checkboxes.forEach(cb => cb.checked = source.checked); }
-
-// 🔥 新增: 支持 organize 参数 (是否联动刮削)
-async function pushSelected(organize = false) {
-    const checkboxes = document.querySelectorAll('.row-chk:checked');
-    if (checkboxes.length === 0) { alert("请先勾选!"); return; }
-    // 提取 IDs
-    const ids = Array.from(checkboxes).map(cb => cb.value.includes('|') ? cb.value.split('|')[0] : cb.value);
-    
-    const btn = event.target; const oldText = btn.innerText; btn.innerText = "处理中..."; btn.disabled = true;
-    try { 
-        // 调用新的智能接口
-        const res = await request('push', { method: 'POST', body: JSON.stringify({ ids, organize }) }); 
-        if (res.success) { alert(`✅ ${res.msg}`); loadDb(dbPage); } else { alert(`❌ 失败: ${res.msg}`); }
-    } catch(e) { alert("网络请求失败"); }
-    btn.innerText = oldText; btn.disabled = false;
-}
-
-async function organizeSelected() {
-    const checkboxes = document.querySelectorAll('.row-chk:checked');
-    if (checkboxes.length === 0) { alert("请先勾选!"); return; }
-    const ids = Array.from(checkboxes).map(cb => cb.value.includes('|') ? cb.value.split('|')[0] : cb.value);
-    const btn = event.target; btn.innerText = "请求中..."; btn.disabled = true;
-    try { 
-        const res = await request('organize', { method: 'POST', body: JSON.stringify({ ids }) }); 
-        if (res.success) { alert(`✅ 已加入队列: ${res.count}`); } else { alert(`❌ ${res.msg}`); }
-    } catch(e) { alert("网络错误"); }
-    btn.innerText = "🛠️ 仅刮削"; btn.disabled = false;
-}
-
-async function deleteSelected() {
-    const checkboxes = document.querySelectorAll('.row-chk:checked');
-    if (checkboxes.length === 0) { alert("请先勾选!"); return; }
-    if(!confirm(`确定要删除 ${checkboxes.length} 条记录吗？`)) return;
-    const ids = Array.from(checkboxes).map(cb => cb.value.includes('|') ? cb.value.split('|')[0] : cb.value);
-    try { await request('delete', { method: 'POST', body: JSON.stringify({ ids }) }); loadDb(dbPage); } catch(e) {}
-}
-
-async function loadDb(p) {
-    if(p < 1) return;
-    dbPage = p;
-    document.getElementById('page-info').innerText = p;
-    const totalCountEl = document.getElementById('total-count');
-    totalCountEl.innerText = "Loading...";
-    try {
-        const res = await request(`data?page=${p}`);
-        const tbody = document.querySelector('#db-tbl tbody');
-        tbody.innerHTML = '';
-        if(res.data) {
-            totalCountEl.innerText = "总计: " + (res.total || 0);
-            res.data.forEach(r => {
-                const chkValue = `${r.id}|${r.magnets || ''}`;
-                const imgHtml = r.image_url ? `<img src="${r.image_url}" class="cover-img" loading="lazy" onclick="window.open('${r.link}')" style="cursor:pointer">` : `<div class="cover-img" style="display:flex;align-items:center;justify-content:center;color:#555;font-size:10px">无封面</div>`;
-                let statusTags = "";
-                if (r.is_pushed) statusTags += `<span class="tag" style="color:#34d399;background:rgba(16,185,129,0.1)">已推</span>`;
-                if (r.is_renamed) statusTags += `<span class="tag" style="color:#60a5fa;background:rgba(59,130,246,0.1)">已整</span>`;
-                let metaTags = "";
-                if (r.actor) metaTags += `<span class="tag tag-actor">👤 ${r.actor}</span>`;
-                if (r.category) metaTags += `<span class="tag tag-cat">🏷️ ${r.category}</span>`;
-                let cleanMagnet = r.magnets || '';
-                let magnetLabel = '🔗';
-                if(cleanMagnet.includes('.m3u8')) magnetLabel = '📺';
-                if (cleanMagnet.includes('&')) cleanMagnet = cleanMagnet.split('&')[0];
-                const magnetDisplay = cleanMagnet ? `<div class="magnet-link" onclick="navigator.clipboard.writeText('${cleanMagnet}');alert('链接已复制')">${magnetLabel} ${cleanMagnet.substring(0, 20)}...</div>` : '';
-                tbody.innerHTML += `<tr><td><input type="checkbox" class="row-chk" value="${chkValue}"></td><td>${imgHtml}</td><td><div style="font-weight:500;margin-bottom:4px;max-width:300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${r.title}</div><div style="font-size:12px;color:var(--text-sub);font-family:monospace">${r.code || '无番号'}</div>${magnetDisplay}</td><td>${metaTags}</td><td>${statusTags}</td></tr>`;
-            });
-        } else { totalCountEl.innerText = "加载失败"; }
-    } catch(e) { totalCountEl.innerText = "网络错误"; }
-}
-
-let lastLogTimeScr = "";
-let lastLogTimeOrg = "";
-setInterval(async () => {
-    if(!document.getElementById('lock').classList.contains('hidden')) return;
-    const res = await request('status');
-    if(!res.config) return;
-    
-    const renderLog = (elId, logs, lastTimeVar) => {
-        const el = document.getElementById(elId);
-        if(!el) return lastTimeVar;
-        if(logs && logs.length > 0) {
-            const latestLog = logs[logs.length-1];
-            const latestSignature = latestLog.time + latestLog.msg;
-            if (latestSignature !== lastTimeVar) {
-                el.innerHTML = logs.map(l => `<div class="log-entry ${l.type==='error'?'err':l.type==='success'?'suc':l.type==='warn'?'warn':''}"><span class="time">[${l.time}]</span> ${l.msg}</div>`).join('');
-                el.scrollTop = el.scrollHeight;
-                return latestSignature;
-            }
-        }
-        return lastTimeVar;
-    };
-    lastLogTimeScr = renderLog('log-scr', res.state.logs, lastLogTimeScr);
-    lastLogTimeOrg = renderLog('log-org', res.organizerLogs, lastLogTimeOrg);
-    if(res.organizerStats && document.getElementById('org-progress-fill')) {
-        const s = res.organizerStats;
-        const percent = s.total > 0 ? (s.processed / s.total) * 100 : 0;
-        document.getElementById('org-progress-fill').style.width = percent + '%';
-        let statusText = s.current || '空闲';
-        if(s.total > 0) {
-            if(s.processed < s.total) statusText = '🎬 处理中: ' + statusText;
-            else statusText = '✅ 完成';
-        }
-        document.getElementById('org-status-txt').innerText = statusText;
-        document.getElementById('org-status-count').innerText = `${s.processed} / ${s.total}`;
-    }
-    if(document.getElementById('stat-scr')) document.getElementById('stat-scr').innerText = res.state.totalScraped || 0;
-}, 2000);
-EOF
-
-# 6. 重启应用
+# 5. 重启应用
 echo "🔄 重启应用以生效..."
 pkill -f "node app.js" || echo "应用可能未运行。"
 
-echo "✅ [完成] V13.15.0 体验优化版部署完成！"
+echo "✅ [完成] V13.15.1 部署完成，请在设置页填入 Bearer Token 即可！"
