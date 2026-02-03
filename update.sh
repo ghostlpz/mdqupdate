@@ -1,139 +1,407 @@
-import os
-import requests
-import json
-import re
-from urllib.parse import urlparse
+#!/bin/bash
+# VERSION = 13.15.11
 
-# 配置部分 (请确保这些配置存在于你的代码中)
-FLARESOLVERR_URL = "http://localhost:8191/v1"  # 你的 FlareSolverr 地址
-BASE_URL = "https://www.example.com" # 你的目标网站主页，用于伪造 Referer
+# ---------------------------------------------------------
+# Madou-Omni 在线升级脚本
+# 版本: V13.15.11
+# 功能: 1. PikPak 推送时自动创建文件夹 (演员-标题)
+#       2. 支持封面图上传到 PikPak
+#       3. 修复图片抓取正则 & 增加穿盾下载逻辑
+# ---------------------------------------------------------
 
-def sanitize_filename(name):
-    """清理文件名，去除系统不允许的特殊字符"""
-    return re.sub(r'[\\/*?:"<>|]', "", name).strip()
+echo "🚀 [Update] 开始部署完美归档版 (V13.15.11)..."
 
-def get_cookies_via_flaresolverr(target_url):
-    """通过 FlareSolverr 获取通过验证的 Cookies 和 User-Agent"""
-    headers = {"Content-Type": "application/json"}
-    data = {
-        "cmd": "request.get",
-        "url": target_url,
-        "maxTimeout": 60000
-    }
-    
+# 1. 更新 package.json
+sed -i 's/"version": ".*"/"version": "13.15.11"/' package.json
+
+# 2. 升级 bridge.py (增加建文件夹和上传功能)
+echo "📝 [1/3] 升级 Python 桥接服务 (支持上传)..."
+cat > /app/python_service/bridge.py << 'EOF'
+from flask import Flask, request, jsonify
+from pikpakapi import PikPakApi
+import asyncio
+import logging
+import hashlib
+import base64
+
+app = Flask(__name__)
+SESSION = {
+    "username": None, "password": None, "access_token": None, 
+    "refresh_token": None, "user_id": None, "device_id": None, "proxy": None
+}
+logging.basicConfig(level=logging.INFO)
+
+def get_client():
+    httpx_args = {"timeout": 30}
+    if SESSION["proxy"]: httpx_args["proxy"] = SESSION["proxy"]
+    client = PikPakApi(
+        username=SESSION["username"], password=SESSION["password"], 
+        device_id=SESSION["device_id"], httpx_client_args=httpx_args
+    )
+    if SESSION["access_token"]:
+        client.access_token = SESSION["access_token"]
+        client.refresh_token = SESSION["refresh_token"]
+        client.user_id = SESSION["user_id"]
+    return client
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
+    proxy = data.get('proxy')
+    httpx_args = {"timeout": 30}
+    if proxy: httpx_args["proxy"] = proxy
+    temp_client = PikPakApi(username=username, password=password, httpx_client_args=httpx_args)
     try:
-        response = requests.post(FLARESOLVERR_URL, headers=headers, json=data)
-        if response.status_code == 200:
-            result = response.json()
-            if result.get('status') == 'ok':
-                solution = result['solution']
-                return {
-                    "cookies": {cookie['name']: cookie['value'] for cookie in solution['cookies']},
-                    "user_agent": solution['userAgent']
-                }
+        asyncio.run(temp_client.login())
+        SESSION.update({
+            "username": username, "password": password, "proxy": proxy,
+            "access_token": temp_client.access_token, "refresh_token": temp_client.refresh_token,
+            "user_id": temp_client.user_id, "device_id": temp_client.device_id
+        })
+        return jsonify({'success': True})
     except Exception as e:
-        print(f"[!] FlareSolverr 调用失败: {e}")
-    return None
+        return jsonify({'success': False, 'msg': str(e)}), 500
 
-def download_file(url, save_path, referer_url=None, use_flaresolverr=False):
-    """
-    通用下载函数：支持图片和视频
-    1. 尝试普通下载（带 Referer）
-    2. 如果失败且开启了 FlareSolverr，获取 Cookie 后重试
-    """
-    
-    # 默认请求头，伪装成浏览器，并带上 Referer (解决防盗链的关键)
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': referer_url if referer_url else BASE_URL
-    }
-
-    session = requests.Session()
-
-    # 逻辑：如果指定要用 FlareSolverr，先获取 Cookie
-    if use_flaresolverr:
-        print(f"[*] 正在调用 FlareSolverr 获取权限: {url}...")
-        fs_data = get_cookies_via_flaresolverr(url) # 或者传入页面 URL
-        if fs_data:
-            session.cookies.update(fs_data['cookies'])
-            headers['User-Agent'] = fs_data['user_agent']
-            print("[+] 成功获取 FlareSolverr Cookies")
-
+@app.route('/create_folder', methods=['POST'])
+def create_folder():
+    if not SESSION["access_token"]: return jsonify({'success': False, 'msg': 'No Token'}), 401
+    data = request.json
+    name = data.get('name')
+    parent_id = data.get('parent_id')
+    client = get_client()
     try:
-        # 发起请求 (stream=True 对大文件/视频很重要)
-        with session.get(url, headers=headers, stream=True, timeout=30) as r:
-            # 检查状态码
-            if r.status_code != 200:
-                print(f"[!] 下载失败，状态码: {r.status_code}")
-                # 如果普通请求失败（比如403），且还没用 FlareSolverr，可以在这里递归调用自己开启 FlareSolverr
-                if not use_flaresolverr and r.status_code in [403, 503]:
-                    print("[*] 触发 403/503，尝试使用 FlareSolverr 重试...")
-                    return download_file(url, save_path, referer_url, use_flaresolverr=True)
-                return False
-
-            # 写入文件
-            with open(save_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            print(f"[+] 文件已保存: {save_path}")
-            return True
-
+        res = asyncio.run(client.create_folder(name=name, parent_id=parent_id))
+        return jsonify({'success': True, 'data': res})
     except Exception as e:
-        print(f"[!] 下载异常: {e}")
-        return False
+        return jsonify({'success': False, 'msg': str(e)}), 500
 
-def push_content_to_local(video_data, base_download_path="./Downloads"):
-    """
-    核心推送逻辑：建立文件夹并保存视频和图片
-    video_data: 包含 'title', 'actor', 'video_url', 'cover_url', 'page_url' 的字典
-    """
-    actor = sanitize_filename(video_data.get('actor', '未知演员'))
-    title = sanitize_filename(video_data.get('title', '未知标题'))
+@app.route('/add_task', methods=['POST'])
+def add_task():
+    if not SESSION["access_token"]: return jsonify({'success': False}), 401
+    data = request.json
+    client = get_client()
+    try:
+        res = asyncio.run(client.offline_download(file_url=data.get('url'), parent_id=data.get('parent_id')))
+        return jsonify({'success': True, 'data': res})
+    except Exception as e:
+        return jsonify({'success': False, 'msg': str(e)}), 500
+
+@app.route('/upload_file', methods=['POST'])
+def upload_file():
+    if not SESSION["access_token"]: return jsonify({'success': False}), 401
+    data = request.json
+    name = data.get('name')
+    parent_id = data.get('parent_id')
+    file_content = base64.b64decode(data.get('content')) # 接收 Base64
     
-    # 1. 建立文件夹: 演员-标题
-    folder_name = f"{actor}-{title}"
-    folder_path = os.path.join(base_download_path, folder_name)
-    
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path)
-        print(f"[*] 创建目录: {folder_path}")
-    
-    # 2. 下载海报 (保存为 poster.jpg 或 poster.webp)
-    cover_url = video_data.get('cover_url')
-    if cover_url:
-        # 提取后缀名 (如 .jpg, .webp)，如果没有则默认 .jpg
-        ext = os.path.splitext(urlparse(cover_url).path)[1]
-        if not ext: ext = ".jpg"
+    client = get_client()
+    try:
+        # 手动实现上传流程
+        # 1. 计算 Hash
+        sha1 = hashlib.sha1(file_content).hexdigest()
+        size = len(file_content)
         
-        poster_path = os.path.join(folder_path, f"poster{ext}") # 命名为 poster 方便刮削
+        # 2. 创建上传任务
+        create_url = f"https://{client.PIKPAK_API_HOST}/drive/v1/files"
+        payload = {
+            "kind": "drive#file", "name": name, "upload_type": "UPLOAD_TYPE_RESUMABLE",
+            "hash": sha1, "size": size
+        }
+        if parent_id: payload["parent_id"] = parent_id
         
-        print(f"[*] 开始下载海报: {cover_url}")
-        # 传入 page_url 作为 Referer，这是解决防盗链最有效的方法
-        download_file(cover_url, poster_path, referer_url=video_data.get('page_url'))
-    
-    # 3. 下载视频
-    video_url = video_data.get('video_url')
-    if video_url:
-        # 简单判断是 m3u8 还是直链
-        if ".m3u8" in video_url:
-            print(f"[!] 注意: 这是一个 m3u8 流媒体，直接保存只能得到列表文件。你需要调用 ffmpeg 下载。")
-            # 这里可以扩展 ffmpeg 下载逻辑，暂时先保存 m3u8 文件
-            video_path = os.path.join(folder_path, f"{title}.m3u8")
-        else:
-            video_path = os.path.join(folder_path, f"{title}.mp4")
+        # 使用 client 的内部方法发送请求
+        create_res = asyncio.run(client._request_post(create_url, payload))
+        upload_url = create_res.get("upload_url")
+        file_id = create_res.get("file", {}).get("id")
+        
+        # 3. 上传数据
+        if upload_url:
+            # PUT 请求需要特殊的 content-type
+            headers = {"Content-Type": ""}
+            asyncio.run(client.httpx_client.put(upload_url, content=file_content, headers=headers))
             
-        print(f"[*] 开始下载视频: {video_url}")
-        download_file(video_url, video_path, referer_url=video_data.get('page_url'))
+        return jsonify({'success': True, 'file_id': file_id})
+    except Exception as e:
+        logging.exception("Upload failed")
+        return jsonify({'success': False, 'msg': str(e)}), 500
 
-# --- 测试调用 ---
-if __name__ == "__main__":
-    # 模拟数据
-    sample_data = {
-        "title": "测试视频标题",
-        "actor": "某某演员",
-        "cover_url": "https://upload.xchina.io/video/67ee3a8d3a95d.webp", # 你的难搞图片
-        "video_url": "https://example.com/video.mp4",
-        "page_url": "https://xxxxx.com/view/123" # 视频所在的网页地址
-    }
+@app.route('/test', methods=['GET'])
+def test():
+    if not SESSION["access_token"]: return jsonify({'success': False}), 401
+    client = get_client()
+    try:
+        res = asyncio.run(client.file_list(limit=1))
+        return jsonify({'success': True, 'data': res})
+    except Exception as e:
+        return jsonify({'success': False, 'msg': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5005)
+EOF
+
+# 3. 升级 LoginPikPak (暴露新接口)
+echo "📝 [2/3] 升级 PikPak 驱动..."
+cat > modules/login_pikpak.js << 'EOF'
+const axios = require('axios');
+const { spawn } = require('child_process');
+
+let pythonProcess = null;
+const BRIDGE_URL = 'http://127.0.0.1:5005';
+
+const LoginPikPak = {
+    auth: { username: '', password: '' },
+    proxy: null,
+
+    setConfig(cfg) {
+        if (!cfg) return;
+        if (cfg.pikpak && cfg.pikpak.includes('|')) {
+            const parts = cfg.pikpak.split('|');
+            this.auth.username = parts[0].trim();
+            this.auth.password = parts[1].trim();
+        }
+        if (cfg.proxy) this.proxy = cfg.proxy;
+        this.ensureBridgeRunning();
+    },
+
+    ensureBridgeRunning() {
+        if (pythonProcess && !pythonProcess.killed) return;
+        console.log('🐍 [Bridge] 正在启动 Python 中间件...');
+        pythonProcess = spawn('python3', ['-u', '/app/python_service/bridge.py'], { stdio: 'inherit' });
+        pythonProcess.on('error', (err) => console.error('🐍 [Bridge] 启动失败:', err));
+    },
+
+    async waitForBridge() {
+        this.ensureBridgeRunning();
+        for (let i = 0; i < 20; i++) {
+            try {
+                await axios.get(`${BRIDGE_URL}/test`, { timeout: 1000 });
+                return true;
+            } catch (e) {
+                if (e.code !== 'ECONNREFUSED' && e.code !== 'ECONNRESET') return true;
+                await new Promise(r => setTimeout(r, 500));
+            }
+        }
+        return false;
+    },
+
+    async login() {
+        await this.waitForBridge();
+        try {
+            const payload = { username: this.auth.username, password: this.auth.password, proxy: this.proxy };
+            const res = await axios.post(`${BRIDGE_URL}/login`, payload);
+            return res.data.success;
+        } catch (e) { return false; }
+    },
+
+    async testConnection() {
+        await this.waitForBridge();
+        const loginOk = await this.login();
+        if (!loginOk) return { success: false, msg: "登录失败" };
+        try {
+            const res = await axios.get(`${BRIDGE_URL}/test`);
+            if (res.data.success) return { success: true, msg: "✅ 桥接连接成功" };
+            return { success: false, msg: res.data.msg };
+        } catch(e) { return { success: false, msg: e.message }; }
+    },
+
+    // 🔥 新增: 创建文件夹
+    async createFolder(name, parentId = '') {
+        await this.waitForBridge();
+        try {
+            const res = await axios.post(`${BRIDGE_URL}/create_folder`, { name, parent_id: parentId });
+            if (res.data.success) return res.data.data.file.id;
+        } catch (e) { console.error('🐍 CreateFolder Err:', e.message); }
+        return null;
+    },
+
+    // 🔥 新增: 上传文件
+    async uploadFile(buffer, name, parentId = '') {
+        await this.waitForBridge();
+        try {
+            // 转为 Base64 传给 Python
+            const base64Content = buffer.toString('base64');
+            const res = await axios.post(`${BRIDGE_URL}/upload_file`, { 
+                name, parent_id: parentId, content: base64Content 
+            }, { maxBodyLength: Infinity, maxContentLength: Infinity });
+            return res.data.success;
+        } catch (e) { console.error('🐍 UploadFile Err:', e.message); }
+        return false;
+    },
+
+    async addTask(url, parentId = '') {
+        await this.waitForBridge();
+        try {
+            const res = await axios.post(`${BRIDGE_URL}/add_task`, { url, parent_id: parentId });
+            return res.data.success;
+        } catch (e) { return false; }
+    },
     
-    push_content_to_local(sample_data)
+    // 兼容层
+    async getFileList() { return { data: [] }; },
+    async searchFile() { return { data: [] }; },
+    async rename() { return { success: true }; },
+    async move() { return true; },
+    async getTaskByHash() { return null; } 
+};
+
+if(global.CONFIG) LoginPikPak.setConfig(global.CONFIG);
+module.exports = LoginPikPak;
+EOF
+
+# 4. 升级 Scraper (实现文件夹+海报逻辑)
+echo "📝 [3/3] 升级采集器 (归档/穿盾下载)..."
+cat >> modules/scraper_xchina.js << 'EOF'
+
+// 🔥 补丁: 穿盾下载 helper
+async function downloadImage(url, baseUrl) {
+    if (!url) return null;
+    if (!url.startsWith('http')) url = baseUrl + url;
+    
+    // 使用 axios 配合 User-Agent 和 Referer 尝试穿盾
+    try {
+        const config = { 
+            responseType: 'arraybuffer',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Referer': baseUrl
+            },
+            timeout: 15000
+        };
+        // 如果配了代理，走代理
+        if (global.CONFIG.proxy) {
+            const { HttpsProxyAgent } = require('https-proxy-agent');
+            config.httpsAgent = new HttpsProxyAgent(global.CONFIG.proxy);
+            config.proxy = false;
+        }
+        
+        const res = await axios.get(url, config);
+        return res.data;
+    } catch (e) {
+        console.error(`🖼️ 图片下载失败: ${e.message}`);
+        return null;
+    }
+}
+
+// 🔥 补丁: 覆盖 processVideoTask
+async function processVideoTask(task, baseUrl, autoDownload) {
+    const { link } = task; 
+    
+    const flareApi = getFlareUrl();
+    let htmlContent = "";
+    try {
+        const payload = { cmd: 'request.get', url: link, maxTimeout: 60000 };
+        if (global.CONFIG.proxy) payload.proxy = { url: global.CONFIG.proxy };
+        const res = await axios.post(flareApi, payload, { headers: { 'Content-Type': 'application/json' } });
+        if (res.data.status === 'ok') htmlContent = res.data.solution.response;
+        else throw new Error(res.data.message);
+    } catch(e) { throw new Error(`Req Err: ${e.message}`); }
+
+    const $ = cheerio.load(htmlContent);
+    let title = $('h1').text().trim() || task.title;
+    
+    // 🔥 增强版图片正则 (支持转义字符)
+    let image = '';
+    // 匹配 poster: 'https:\/\/...' 或 poster: "..."
+    const regexPoster = /(?:poster|pic|thumb)\s*[:=]\s*['"]([^'"]+)['"]/i;
+    const match = htmlContent.match(regexPoster);
+    if (match && match[1]) {
+        image = match[1].replace(/\\\//g, '/'); // 修复转义斜杠
+    } else {
+        image = $('.vjs-poster img').attr('src') || $('video').attr('poster');
+    }
+    if (image && !image.startsWith('http')) image = baseUrl + image;
+
+    const actor = $('.model-container .model-item').text().trim() || '未知演员';
+    let category = '未分类';
+    $('.text').each((i, el) => { if ($(el).find('.joiner').length > 0) category = $(el).find('a').last().text().trim(); });
+
+    let code = '';
+    const codeMatch = link.match(/id-([a-zA-Z0-9]+)/);
+    if (codeMatch) code = codeMatch[1];
+
+    let magnet = '';
+    let driveType = '115';
+
+    // 1. 找磁力
+    try {
+        const downloadLinkEl = $('a[href*="/download/id-"]');
+        if (downloadLinkEl.length > 0) {
+            let downloadPageUrl = downloadLinkEl.attr('href');
+            if (downloadPageUrl && !downloadPageUrl.startsWith('http')) downloadPageUrl = baseUrl + downloadPageUrl;
+            const dlPayload = { cmd: 'request.get', url: downloadPageUrl, maxTimeout: 30000 };
+            if (global.CONFIG.proxy) dlPayload.proxy = { url: global.CONFIG.proxy };
+            const dlRes = await axios.post(flareApi, dlPayload);
+            if (dlRes.data.status === 'ok') {
+                const $d = cheerio.load(dlRes.data.solution.response);
+                const rawMagnet = $d('a.btn.magnet').attr('href');
+                if (rawMagnet) magnet = cleanMagnet(rawMagnet);
+            }
+        }
+    } catch (e) {}
+
+    // 2. 找 M3U8
+    if (!magnet) {
+        const regexVideo = /src:\s*['"](https?:\/\/[^'"]+\.m3u8[^'"]*)['"]/;
+        const matchVideo = htmlContent.match(regexVideo);
+        if (matchVideo && matchVideo[1]) {
+            magnet = matchVideo[1].replace(/\\\//g, '/');
+            driveType = 'pikpak';
+            log(`🔎 [${code}] 启用 M3U8 (PikPak)`, 'info');
+        }
+    }
+
+    if (magnet) {
+        const storageValue = driveType === 'pikpak' ? `pikpak|${magnet}` : magnet;
+        const saveRes = await ResourceMgr.save({
+            title, link, magnets: storageValue, code, image, actor, category
+        });
+
+        if (saveRes.success && saveRes.newInsert) {
+            STATE.totalScraped++;
+            let extraMsg = "";
+            
+            // 🔥 自动归档流程 🔥
+            if (driveType === 'pikpak') {
+                // 1. 创建文件夹
+                const folderName = `${actor} - ${title}`.trim();
+                const folderId = await LoginPikPak.createFolder(folderName);
+                
+                if (folderId) {
+                    // 2. 推送视频到该文件夹
+                    const pushed = await LoginPikPak.addTask(magnet, folderId);
+                    
+                    // 3. 下载并上传海报
+                    if (image) {
+                        const imgBuf = await downloadImage(image, baseUrl);
+                        if (imgBuf) {
+                            await LoginPikPak.uploadFile(imgBuf, 'poster.jpg', folderId);
+                        }
+                    }
+                    extraMsg = pushed ? " | 🚀 已推送+归档" : " | ⚠️ 推送失败";
+                    if(pushed) await ResourceMgr.markAsPushedByLink(link);
+                } else {
+                    extraMsg = " | ⚠️ 建文件夹失败";
+                }
+            } else {
+                extraMsg = " | 💾 仅存库";
+            }
+
+            log(`✅ [入库] ${code} | ${title.substring(0, 10)}...${extraMsg}`, 'success');
+            return true;
+        } else if (!saveRes.newInsert) {
+            log(`⏭️ [已存在] ${title.substring(0, 10)}...`, 'info');
+            return true;
+        }
+    }
+    return false;
+}
+EOF
+
+# 5. 重启应用
+echo "🔄 重启应用..."
+pkill -f "node app.js" || echo "应用可能未运行。"
+pkill -f "python3 -u /app/python_service/bridge.py" || true
+
+echo "✅ [完成] V13.15.11 部署完成！"
