@@ -1,132 +1,139 @@
-#!/bin/bash
-# VERSION = 13.15.10
+import os
+import requests
+import json
+import re
+from urllib.parse import urlparse
 
-# ---------------------------------------------------------
-# Madou-Omni 在线升级脚本
-# 版本: V13.15.10
-# 修复: Python 桥接服务 Event loop is closed 错误 (改为单例 Token 多例 Client)
-# ---------------------------------------------------------
+# 配置部分 (请确保这些配置存在于你的代码中)
+FLARESOLVERR_URL = "http://localhost:8191/v1"  # 你的 FlareSolverr 地址
+BASE_URL = "https://www.example.com" # 你的目标网站主页，用于伪造 Referer
 
-echo "🚀 [Update] 开始部署异步循环修复版 (V13.15.10)..."
+def sanitize_filename(name):
+    """清理文件名，去除系统不允许的特殊字符"""
+    return re.sub(r'[\\/*?:"<>|]', "", name).strip()
 
-# 1. 更新 package.json
-sed -i 's/"version": ".*"/"version": "13.15.10"/' package.json
-
-# 2. 重写 bridge.py (关键修复: 每次请求重新实例化 Client)
-echo "📝 [1/1] 修正 Python 桥接服务..."
-cat > /app/python_service/bridge.py << 'EOF'
-from flask import Flask, request, jsonify
-from pikpakapi import PikPakApi
-import asyncio
-import logging
-
-app = Flask(__name__)
-
-# 🔥 全局只存 Session 数据，不存 client 对象
-SESSION = {
-    "username": None,
-    "password": None,
-    "access_token": None,
-    "refresh_token": None,
-    "user_id": None,
-    "device_id": None,
-    "proxy": None
-}
-
-logging.basicConfig(level=logging.INFO)
-
-# 工厂函数: 每次调用生成一个带 Token 的新 Client
-def get_fresh_client():
-    httpx_args = {"timeout": 30}
-    if SESSION["proxy"]:
-        httpx_args["proxy"] = SESSION["proxy"]
-        
-    client = PikPakApi(
-        username=SESSION["username"], 
-        password=SESSION["password"], 
-        device_id=SESSION["device_id"], # 保持 DeviceID 一致防止风控
-        httpx_client_args=httpx_args
-    )
-    
-    # 注入保存的 Token，免登录
-    if SESSION["access_token"]:
-        client.access_token = SESSION["access_token"]
-        client.refresh_token = SESSION["refresh_token"]
-        client.user_id = SESSION["user_id"]
-        
-    return client
-
-@app.route('/login', methods=['POST'])
-def login():
-    data = request.json
-    username = data.get('username')
-    password = data.get('password')
-    proxy = data.get('proxy')
-    
-    httpx_args = {"timeout": 30}
-    if proxy:
-        httpx_args["proxy"] = proxy
-        
-    # 登录时创建临时 Client
-    temp_client = PikPakApi(username=username, password=password, httpx_client_args=httpx_args)
+def get_cookies_via_flaresolverr(target_url):
+    """通过 FlareSolverr 获取通过验证的 Cookies 和 User-Agent"""
+    headers = {"Content-Type": "application/json"}
+    data = {
+        "cmd": "request.get",
+        "url": target_url,
+        "maxTimeout": 60000
+    }
     
     try:
-        asyncio.run(temp_client.login())
-        
-        # 登录成功，保存 Session 数据
-        SESSION["username"] = username
-        SESSION["password"] = password
-        SESSION["proxy"] = proxy
-        SESSION["access_token"] = temp_client.access_token
-        SESSION["refresh_token"] = temp_client.refresh_token
-        SESSION["user_id"] = temp_client.user_id
-        SESSION["device_id"] = temp_client.device_id
-        
-        return jsonify({'success': True, 'msg': 'Login Successful'})
+        response = requests.post(FLARESOLVERR_URL, headers=headers, json=data)
+        if response.status_code == 200:
+            result = response.json()
+            if result.get('status') == 'ok':
+                solution = result['solution']
+                return {
+                    "cookies": {cookie['name']: cookie['value'] for cookie in solution['cookies']},
+                    "user_agent": solution['userAgent']
+                }
     except Exception as e:
-        logging.exception("Login failed")
-        return jsonify({'success': False, 'msg': str(e)}), 500
+        print(f"[!] FlareSolverr 调用失败: {e}")
+    return None
 
-@app.route('/add_task', methods=['POST'])
-def add_task():
-    if not SESSION["access_token"]:
-        return jsonify({'success': False, 'msg': 'Not Logged In'}), 401
+def download_file(url, save_path, referer_url=None, use_flaresolverr=False):
+    """
+    通用下载函数：支持图片和视频
+    1. 尝试普通下载（带 Referer）
+    2. 如果失败且开启了 FlareSolverr，获取 Cookie 后重试
+    """
     
-    data = request.json
-    url = data.get('url')
-    parent_id = data.get('parent_id')
-    
-    # 🔥 关键点: 每次请求用新的 Client，避免 Event Loop 关闭问题
-    client = get_fresh_client()
-    
+    # 默认请求头，伪装成浏览器，并带上 Referer (解决防盗链的关键)
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': referer_url if referer_url else BASE_URL
+    }
+
+    session = requests.Session()
+
+    # 逻辑：如果指定要用 FlareSolverr，先获取 Cookie
+    if use_flaresolverr:
+        print(f"[*] 正在调用 FlareSolverr 获取权限: {url}...")
+        fs_data = get_cookies_via_flaresolverr(url) # 或者传入页面 URL
+        if fs_data:
+            session.cookies.update(fs_data['cookies'])
+            headers['User-Agent'] = fs_data['user_agent']
+            print("[+] 成功获取 FlareSolverr Cookies")
+
     try:
-        res = asyncio.run(client.offline_download(file_url=url, parent_id=parent_id))
-        return jsonify({'success': True, 'data': res})
-    except Exception as e:
-        logging.exception("Add task failed")
-        return jsonify({'success': False, 'msg': str(e)}), 500
+        # 发起请求 (stream=True 对大文件/视频很重要)
+        with session.get(url, headers=headers, stream=True, timeout=30) as r:
+            # 检查状态码
+            if r.status_code != 200:
+                print(f"[!] 下载失败，状态码: {r.status_code}")
+                # 如果普通请求失败（比如403），且还没用 FlareSolverr，可以在这里递归调用自己开启 FlareSolverr
+                if not use_flaresolverr and r.status_code in [403, 503]:
+                    print("[*] 触发 403/503，尝试使用 FlareSolverr 重试...")
+                    return download_file(url, save_path, referer_url, use_flaresolverr=True)
+                return False
 
-@app.route('/test', methods=['GET'])
-def test():
-    if not SESSION["access_token"]:
-        return jsonify({'success': False, 'msg': 'Session not initialized'}), 401
+            # 写入文件
+            with open(save_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print(f"[+] 文件已保存: {save_path}")
+            return True
+
+    except Exception as e:
+        print(f"[!] 下载异常: {e}")
+        return False
+
+def push_content_to_local(video_data, base_download_path="./Downloads"):
+    """
+    核心推送逻辑：建立文件夹并保存视频和图片
+    video_data: 包含 'title', 'actor', 'video_url', 'cover_url', 'page_url' 的字典
+    """
+    actor = sanitize_filename(video_data.get('actor', '未知演员'))
+    title = sanitize_filename(video_data.get('title', '未知标题'))
+    
+    # 1. 建立文件夹: 演员-标题
+    folder_name = f"{actor}-{title}"
+    folder_path = os.path.join(base_download_path, folder_name)
+    
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
+        print(f"[*] 创建目录: {folder_path}")
+    
+    # 2. 下载海报 (保存为 poster.jpg 或 poster.webp)
+    cover_url = video_data.get('cover_url')
+    if cover_url:
+        # 提取后缀名 (如 .jpg, .webp)，如果没有则默认 .jpg
+        ext = os.path.splitext(urlparse(cover_url).path)[1]
+        if not ext: ext = ".jpg"
         
-    client = get_fresh_client()
-    try:
-        res = asyncio.run(client.file_list(limit=1))
-        return jsonify({'success': True, 'data': res})
-    except Exception as e:
-        return jsonify({'success': False, 'msg': str(e)}), 500
+        poster_path = os.path.join(folder_path, f"poster{ext}") # 命名为 poster 方便刮削
+        
+        print(f"[*] 开始下载海报: {cover_url}")
+        # 传入 page_url 作为 Referer，这是解决防盗链最有效的方法
+        download_file(cover_url, poster_path, referer_url=video_data.get('page_url'))
+    
+    # 3. 下载视频
+    video_url = video_data.get('video_url')
+    if video_url:
+        # 简单判断是 m3u8 还是直链
+        if ".m3u8" in video_url:
+            print(f"[!] 注意: 这是一个 m3u8 流媒体，直接保存只能得到列表文件。你需要调用 ffmpeg 下载。")
+            # 这里可以扩展 ffmpeg 下载逻辑，暂时先保存 m3u8 文件
+            video_path = os.path.join(folder_path, f"{title}.m3u8")
+        else:
+            video_path = os.path.join(folder_path, f"{title}.mp4")
+            
+        print(f"[*] 开始下载视频: {video_url}")
+        download_file(video_url, video_path, referer_url=video_data.get('page_url'))
 
-if __name__ == '__main__':
-    print("🚀 Python Bridge running on port 5005...")
-    app.run(host='0.0.0.0', port=5005)
-EOF
-
-# 3. 杀掉旧进程并重启
-echo "🔄 重启应用..."
-pkill -f "python3 -u /app/python_service/bridge.py" || true
-pkill -f "node app.js" || echo "应用可能未运行。"
-
-echo "✅ [完成] V13.15.10 部署完成！"
-echo "👉 这次应该稳了，请再次测试采集！"
+# --- 测试调用 ---
+if __name__ == "__main__":
+    # 模拟数据
+    sample_data = {
+        "title": "测试视频标题",
+        "actor": "某某演员",
+        "cover_url": "https://upload.xchina.io/video/67ee3a8d3a95d.webp", # 你的难搞图片
+        "video_url": "https://example.com/video.mp4",
+        "page_url": "https://xxxxx.com/view/123" # 视频所在的网页地址
+    }
+    
+    push_content_to_local(sample_data)
