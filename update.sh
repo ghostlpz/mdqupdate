@@ -1,25 +1,25 @@
 #!/bin/bash
-# VERSION = 13.15.3
+# VERSION = 13.15.4
 
 # ---------------------------------------------------------
 # Madou-Omni 在线升级脚本
-# 版本: V13.15.3
-# 核心: 1:1 复刻 Python 脚本的 App 协议 (解决登录和推送失败)
+# 版本: V13.15.4
+# 功能: 开启 PikPak 登录的"核磁共振"级调试日志
 # ---------------------------------------------------------
 
-echo "🚀 [Update] 开始部署 App 协议复刻版 (V13.15.3)..."
+echo "🚀 [Update] 开始部署深度调试版 (V13.15.4)..."
 
 # 1. 更新 package.json
-sed -i 's/"version": ".*"/"version": "13.15.3"/' package.json
+sed -i 's/"version": ".*"/"version": "13.15.4"/' package.json
 
-# 2. 重写 LoginPikPak (使用 Python 脚本中的 ID/Secret)
-echo "📝 [1/1] 替换为 App 鉴权协议..."
+# 2. 注入调试版 LoginPikPak
+echo "📝 [1/1] 注入调试探针..."
 cat > modules/login_pikpak.js << 'EOF'
 const axios = require('axios');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const path = require('path');
 
-// 🔥 核心修正: 移植自 Python 脚本的 App ID
+// 移植自 pikpak-master
 const CLIENT_ID = "YNxT9w7GMdWvEOKa";
 const CLIENT_SECRET = "dbw2OtmVEeuUvIptb1Coygx";
 
@@ -30,7 +30,7 @@ const LoginPikPak = {
         token: '',
         refreshToken: '',
         userId: '',
-        deviceId: 'madou_omni_v1' // 仅保留用于内部标识，不发给服务器
+        deviceId: 'madou_omni_debug'
     },
     proxy: null,
     
@@ -46,19 +46,9 @@ const LoginPikPak = {
                 this.auth.token = val;
             }
         }
-        // 读取缓存 Token
-        if (cfg.pikpak_token) {
-            try {
-                const t = JSON.parse(cfg.pikpak_token);
-                if (t.access_token) this.auth.token = 'Bearer ' + t.access_token;
-                if (t.refresh_token) this.auth.refreshToken = t.refresh_token;
-                if (t.user_id) this.auth.userId = t.user_id;
-            } catch(e) {}
-        }
         if (cfg.proxy) this.proxy = cfg.proxy;
     },
 
-    // 🔥 修正: 严格对齐 Python 脚本的 Header (移除 X-Device-Id)
     getAxiosConfig() {
         const config = {
             headers: {
@@ -67,12 +57,20 @@ const LoginPikPak = {
             },
             timeout: 15000
         };
-        if (this.auth.token) {
-            config.headers['Authorization'] = this.auth.token;
-        }
+        if (this.auth.token) config.headers['Authorization'] = this.auth.token;
+        
+        // 🔍 调试日志: 代理配置
         if (this.proxy) {
-            config.httpsAgent = new HttpsProxyAgent(this.proxy);
-            config.proxy = false;
+            try {
+                // 简单校验代理格式
+                if (!this.proxy.startsWith('http')) {
+                    console.warn(`⚠️ [Debug] 代理地址格式可能错误 (建议 http://...): ${this.proxy}`);
+                }
+                config.httpsAgent = new HttpsProxyAgent(this.proxy);
+                config.proxy = false;
+            } catch (e) {
+                console.error(`❌ [Debug] 代理初始化失败: ${e.message}`);
+            }
         }
         return config;
     },
@@ -93,9 +91,12 @@ const LoginPikPak = {
     },
 
     async login() {
-        // 1. 尝试刷新 Token
+        console.log('------------------------------------------------');
+        console.log('🧪 [PikPak Debug] 开始登录流程...');
+        
+        // 1. 尝试刷新
         if (this.auth.refreshToken) {
-            console.log('🔄 PikPak 尝试刷新 Token...');
+            console.log('🔄 [Debug] 检测到 Refresh Token，尝试刷新...');
             try {
                 const url = 'https://user.mypikpak.com/v1/auth/token';
                 const payload = {
@@ -104,187 +105,135 @@ const LoginPikPak = {
                     grant_type: "refresh_token",
                     refresh_token: this.auth.refreshToken
                 };
+                
                 const res = await axios.post(url, payload, this.getAxiosConfig());
                 if (res.data && res.data.access_token) {
+                    console.log('✅ [Debug] 刷新成功!');
                     this.saveToken(res.data);
-                    console.log('✅ Token 刷新成功');
                     return true;
                 }
             } catch (e) {
-                console.warn('⚠️ 刷新失败:', e.message);
+                console.warn('⚠️ [Debug] 刷新失败 (将尝试账号登录):', e.message);
                 this.auth.refreshToken = ''; 
             }
         }
 
-        // 2. 账号密码登录
-        if (!this.auth.username || !this.auth.password) return !!this.auth.token;
+        // 2. 账号登录
+        console.log(`👤 [Debug] 用户名: ${this.auth.username ? this.auth.username.substring(0,3)+'***' : '未设置'}`);
+        console.log(`🔑 [Debug] 密码: ${this.auth.password ? '******' : '未设置'}`);
+        console.log(`🌐 [Debug] 代理: ${this.proxy || '无'}`);
+
+        if (!this.auth.username || !this.auth.password) {
+            if (this.auth.token) {
+                console.log('ℹ️ [Debug] 无账号密码，但有手动 Token，尝试直接使用...');
+                return true; 
+            }
+            console.error('❌ [Debug] 缺少账号密码，无法登录');
+            return false;
+        }
 
         try {
-            console.log('🔑 PikPak 尝试 App 协议登录...');
             const url = 'https://user.mypikpak.com/v1/auth/signin';
             const payload = {
                 client_id: CLIENT_ID,
-                client_secret: CLIENT_SECRET, // 关键参数
+                client_secret: CLIENT_SECRET,
                 username: this.auth.username,
                 password: this.auth.password
             };
             
             const config = this.getAxiosConfig();
-            delete config.headers['Authorization']; // 登录不需要 Auth 头
+            delete config.headers['Authorization'];
 
+            console.log(`🚀 [Debug] 发起请求: POST ${url}`);
+            
             const res = await axios.post(url, payload, config);
+            
+            console.log(`📥 [Debug] 收到响应: Status ${res.status}`);
             if (res.data && res.data.access_token) {
-                console.log('✅ 登录成功');
+                console.log('✅ [Debug] 登录成功! 拿到 Token');
                 this.saveToken(res.data);
                 return true;
+            } else {
+                console.error('❌ [Debug] 响应数据异常:', JSON.stringify(res.data));
             }
         } catch (e) {
-            const status = e.response ? e.response.status : 'Network Error';
-            const data = e.response ? JSON.stringify(e.response.data) : e.message;
-            console.error(`❌ 登录失败 [${status}]: ${data}`);
+            console.error('------------------------------------------------');
+            console.error('❌ [PikPak Login Error Details]');
+            if (e.response) {
+                // 服务器有返回，但状态码非 2xx
+                console.error(`Status Code: ${e.response.status}`);
+                console.error(`Status Text: ${e.response.statusText}`);
+                console.error(`Response Data: ${JSON.stringify(e.response.data)}`);
+            } else if (e.request) {
+                // 请求发出去了，没收到响应 (网络问题)
+                console.error('No Response Received (Network Issue)');
+                console.error(`Error Code: ${e.code}`); // 如 ECONNREFUSED, ETIMEDOUT
+                console.error(`Error Message: ${e.message}`);
+                console.error('Check your Proxy settings!');
+            } else {
+                // 设置请求时出错
+                console.error(`Request Setup Error: ${e.message}`);
+            }
+            console.error('------------------------------------------------');
         }
         return false;
     },
 
     async testConnection() {
-        this.auth.token = ''; this.auth.refreshToken = ''; // 强制重测
+        this.auth.token = ''; this.auth.refreshToken = ''; 
         if(global.CONFIG) global.CONFIG.pikpak_token = '';
 
+        console.log('🧪 [Test] 用户点击测试连接...');
         const success = await this.login();
-        if (!success) return { success: false, msg: "登录失败: 请检查账号/密码或代理" };
+        if (!success) return { success: false, msg: "登录失败，请查看终端详细日志" };
 
         try {
+            console.log('🚀 [Test] 尝试列出文件以验证 Token...');
             const url = `https://api-drive.mypikpak.com/drive/v1/files?filters={"trashed":{"eq":false}}&limit=1`;
             await axios.get(url, this.getAxiosConfig());
-            return { success: true, msg: "✅ 连接成功！(App 协议)" };
+            console.log('✅ [Test] API 访问畅通');
+            return { success: true, msg: "✅ 连接成功！" };
         } catch (e) {
+            console.error(`❌ [Test] API 访问失败: ${e.message}`);
             return { success: false, msg: `API 错误: ${e.message}` };
         }
     },
 
-    // 复刻 Python 的 addTask 逻辑 (解决 400 错误)
-    async addTask(url, parentId = '') {
-        return await this._addTaskInternal(url, parentId, true);
-    },
-
+    // ... 其他函数保持原样 ...
+    async addTask(url, parentId = '') { return await this._addTaskInternal(url, parentId, true); },
     async _addTaskInternal(url, parentId, allowRetry) {
         if (!this.auth.token) await this.login();
         try {
             const apiUrl = 'https://api-drive.mypikpak.com/drive/v1/files';
             let fileName = 'unknown_video';
             try { fileName = path.basename(new URL(url).pathname); } catch(e) {}
-
             const payload = {
                 kind: "drive#file",
                 name: fileName,
                 upload_type: "UPLOAD_TYPE_URL",
-                url: { "url": url }, // 🔥 结构修正
-                folder_type: parentId ? "" : "DOWNLOAD" // 🔥 逻辑修正
+                url: { "url": url },
+                folder_type: parentId ? "" : "DOWNLOAD"
             };
             if (parentId) payload.parent_id = parentId;
-
             const res = await axios.post(apiUrl, payload, this.getAxiosConfig());
             return res.data && (res.data.task || res.data.file); 
         } catch (e) {
             if (allowRetry && e.response && e.response.status === 401) {
-                console.log('⚠️ Token 过期重试...');
+                console.log('⚠️ Token过期重试...');
                 this.auth.token = '';
                 if (await this.login()) return await this._addTaskInternal(url, parentId, false);
             }
-            const errMsg = e.response ? `Status ${e.response.status}: ${JSON.stringify(e.response.data)}` : e.message;
-            console.error('PikPak AddTask Error:', errMsg);
+            console.error('PikPak AddTask Error:', e.response ? JSON.stringify(e.response.data) : e.message);
             return false;
         }
     },
-
-    // 其他方法保持基础实现 (略有精简)
-    async getFileList(parentId = '') {
-        if (!this.auth.token) await this.login();
-        try {
-            let url = `https://api-drive.mypikpak.com/drive/v1/files?filters={"trashed":{"eq":false}}&limit=100`;
-            if (parentId) url += `&parent_id=${parentId}`;
-            const res = await axios.get(url, this.getAxiosConfig());
-            if (res.data && res.data.files) {
-                return { data: res.data.files.map(f => ({
-                    fid: f.id, n: f.name, s: parseInt(f.size||0),
-                    fcid: f.kind === 'drive#folder' ? f.id : undefined,
-                    parent_id: f.parent_id
-                }))};
-            }
-        } catch (e) { console.error(e.message); }
-        return { data: [] };
-    },
-
-    async searchFile(keyword, parentId = '') {
-        if (!this.auth.token) await this.login();
-        try {
-            const list = await this.getFileList(parentId);
-            const matches = list.data.filter(f => f.n.includes(keyword));
-            return { data: matches };
-        } catch (e) { return { data: [] }; }
-    },
-
-    async rename(fileId, newName) {
-        if (!this.auth.token) await this.login();
-        try {
-            const url = `https://api-drive.mypikpak.com/drive/v1/files/${fileId}`;
-            await axios.patch(url, { name: newName }, this.getAxiosConfig());
-            return { success: true };
-        } catch (e) { return { success: false, msg: e.message }; }
-    },
-
-    async move(fileIds, targetCid) {
-        if (!this.auth.token) await this.login();
-        try {
-            const url = 'https://api-drive.mypikpak.com/drive/v1/files/batch_move';
-            await axios.post(url, { ids: fileIds.split(','), to: { parent_id: targetCid } }, this.getAxiosConfig());
-            return true;
-        } catch (e) { return false; }
-    },
-
-    async deleteFiles(fileIds) {
-        if (!this.auth.token) await this.login();
-        try {
-            const url = 'https://api-drive.mypikpak.com/drive/v1/files/batch_trash';
-            await axios.post(url, { ids: fileIds.split(',') }, this.getAxiosConfig());
-            return true;
-        } catch (e) { return false; }
-    },
-
-    async getTaskByHash(hashOrUrl, nameHint = '') {
-        if (!this.auth.token) await this.login();
-        try {
-            if (nameHint) {
-                const searchRes = await this.searchFile(nameHint.substring(0, 10));
-                if (searchRes.data && searchRes.data.length > 0) {
-                    const f = searchRes.data[0];
-                    return { status_code: 2, folder_cid: f.fcid ? f.fid : f.parent_id, file_id: f.fid, percent: 100 };
-                }
-            }
-        } catch (e) {}
-        return null;
-    },
-
-    async uploadFile(fileBuffer, fileName, parentId = '') {
-        if (!this.auth.token) await this.login();
-        try {
-            const createUrl = 'https://api-drive.mypikpak.com/drive/v1/files';
-            const createPayload = { kind: "drive#file", name: fileName, upload_type: "UPLOAD_TYPE_RESUMABLE" };
-            if (parentId) createPayload.parent_id = parentId;
-
-            const res1 = await axios.post(createUrl, createPayload, this.getAxiosConfig());
-            const uploadUrl = res1.data.upload_url;
-            const fileId = res1.data.file.id;
-
-            if (uploadUrl) {
-                const putConfig = this.getAxiosConfig();
-                putConfig.headers['Content-Type'] = ''; 
-                await axios.put(uploadUrl, fileBuffer, putConfig);
-                return fileId;
-            }
-        } catch (e) { console.error('PP Upload Err:', e.message); }
-        return null;
-    }
+    async getFileList(parentId = '') { if (!this.auth.token) await this.login(); try { let url = `https://api-drive.mypikpak.com/drive/v1/files?filters={"trashed":{"eq":false}}&limit=100`; if (parentId) url += `&parent_id=${parentId}`; const res = await axios.get(url, this.getAxiosConfig()); if (res.data && res.data.files) { return { data: res.data.files.map(f => ({ fid: f.id, n: f.name, s: parseInt(f.size||0), fcid: f.kind === 'drive#folder' ? f.id : undefined, parent_id: f.parent_id }))}; } } catch (e) { console.error(e.message); } return { data: [] }; },
+    async searchFile(keyword, parentId = '') { if (!this.auth.token) await this.login(); try { const list = await this.getFileList(parentId); const matches = list.data.filter(f => f.n.includes(keyword)); return { data: matches }; } catch (e) { return { data: [] }; } },
+    async rename(fileId, newName) { if (!this.auth.token) await this.login(); try { const url = `https://api-drive.mypikpak.com/drive/v1/files/${fileId}`; await axios.patch(url, { name: newName }, this.getAxiosConfig()); return { success: true }; } catch (e) { return { success: false, msg: e.message }; } },
+    async move(fileIds, targetCid) { if (!this.auth.token) await this.login(); try { const url = 'https://api-drive.mypikpak.com/drive/v1/files/batch_move'; await axios.post(url, { ids: fileIds.split(','), to: { parent_id: targetCid } }, this.getAxiosConfig()); return true; } catch (e) { return false; } },
+    async deleteFiles(fileIds) { if (!this.auth.token) await this.login(); try { const url = 'https://api-drive.mypikpak.com/drive/v1/files/batch_trash'; await axios.post(url, { ids: fileIds.split(',') }, this.getAxiosConfig()); return true; } catch (e) { return false; } },
+    async getTaskByHash(hashOrUrl, nameHint = '') { if (!this.auth.token) await this.login(); try { if (nameHint) { const searchRes = await this.searchFile(nameHint.substring(0, 10)); if (searchRes.data && searchRes.data.length > 0) { const f = searchRes.data[0]; return { status_code: 2, folder_cid: f.fcid ? f.fid : f.parent_id, file_id: f.fid, percent: 100 }; } } } catch (e) {} return null; },
+    async uploadFile(fileBuffer, fileName, parentId = '') { if (!this.auth.token) await this.login(); try { const createUrl = 'https://api-drive.mypikpak.com/drive/v1/files'; const createPayload = { kind: "drive#file", name: fileName, upload_type: "UPLOAD_TYPE_RESUMABLE" }; if (parentId) createPayload.parent_id = parentId; const res1 = await axios.post(createUrl, createPayload, this.getAxiosConfig()); const uploadUrl = res1.data.upload_url; const fileId = res1.data.file.id; if (uploadUrl) { const putConfig = this.getAxiosConfig(); putConfig.headers['Content-Type'] = ''; await axios.put(uploadUrl, fileBuffer, putConfig); return fileId; } } catch (e) { console.error('PP Upload Err:', e.message); } return null; }
 };
 
 if(global.CONFIG) LoginPikPak.setConfig(global.CONFIG);
@@ -292,7 +241,8 @@ module.exports = LoginPikPak;
 EOF
 
 # 3. 重启应用
-echo "🔄 重启应用以生效..."
+echo "🔄 重启应用..."
 pkill -f "node app.js" || echo "应用可能未运行。"
 
-echo "✅ [完成] V13.15.3 像素级复刻版部署完成！"
+echo "✅ [完成] V13.15.4 部署完成！"
+echo "👉 请现在去网页点击“测试连接”，然后查看这里的日志输出！"
