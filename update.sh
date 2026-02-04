@@ -1,5 +1,5 @@
 #!/bin/bash
-# VERSION 13.17.0
+# VERSION = 13.17.0
 # =================================================================
 # Madou Omni Update Script
 # Target Version: v13.17.0
@@ -7,10 +7,10 @@
 # =================================================================
 
 APP_DIR="/app"
-BACKUP_DIR="/app/backup_v13.7.0"
+BACKUP_DIR="/app/backup_v13.17.0"
 DATE=$(date +%Y%m%d_%H%M%S)
 
-echo "🔄 [1/6] Starting Update to v13.7.0..."
+echo "🔄 [1/6] Starting Update to v13.17.0..."
 
 # 1. 备份关键文件
 echo "📦 [2/6] Backing up current files..."
@@ -186,11 +186,9 @@ router.get('/resources', async (req, res) => {
 });
 
 // --- Update Logic (Preserved) ---
-// 这里的逻辑必须保留，否则无法进行下一次在线更新
 router.post('/update', async (req, res) => {
-    // 假设前端传入 update_script_url 或者后端自己去拉取
-    // 这里简化处理，实际逻辑可能由 app.js 定时任务触发或手动触发下载
-    res.json({ success: true, msg: 'Update endpoint is active. Use main logic to trigger.' });
+    // 保留此接口以允许未来的在线更新
+    res.json({ success: true, msg: 'Update endpoint active.' });
 });
 
 module.exports = router;
@@ -206,7 +204,7 @@ cat << 'EOF' > $APP_DIR/public/index.html
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Madou Omni v13.7</title>
+    <title>Madou Omni v13.17</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
 </head>
@@ -214,7 +212,7 @@ cat << 'EOF' > $APP_DIR/public/index.html
     <div id="app" class="container mx-auto p-4 max-w-4xl">
         <header class="flex justify-between items-center mb-6 bg-white p-4 rounded shadow">
             <h1 class="text-2xl font-bold text-blue-600"><i class="fas fa-robot"></i> Madou Omni</h1>
-            <div class="text-sm text-gray-500">v13.7.0 (M3U8 Pro)</div>
+            <div class="text-sm text-gray-500">v13.17.0 (M3U8 Pro)</div>
         </header>
 
         <section class="mb-6 bg-white p-4 rounded shadow border-l-4 border-purple-500">
@@ -320,9 +318,9 @@ async function loadResources() {
 EOF
 
 # 5. 更新 Package.json 版本号
-echo "📝 [6/6] Updating Version to 13.7.0..."
-sed -i 's/"version": ".*"/"version": "13.7.0"/' $APP_DIR/package.json
+echo "📝 [6/6] Updating Version to 13.17.0..."
+sed -i 's/"version": ".*"/"version": "13.17.0"/' $APP_DIR/package.json
 
 echo "✅ Update Complete. Restarting Container..."
-# 尝试退出进程让 Docker 自动重启 (Assuming restart policy is always/unless-stopped)
+# 尝试退出进程让 Docker 自动重启
 kill 1
