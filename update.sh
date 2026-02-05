@@ -1,22 +1,21 @@
 #!/bin/bash
+# VERSION = 13.16.1
+# ⬆️ 这一行非常重要，系统通过它识别版本号，请勿删除
 
-# 1. 定义新版本号 (比当前版本大)
-NEW_VERSION="13.16.1"
+echo "🚀 [Update] 开始执行在线更新 v13.16.1 ..."
 
-echo "🚀 [Update] 开始执行在线更新 v$NEW_VERSION ..."
-
-# 确保进入应用目录
+# 1. 进入应用目录
 cd /app
 
 # 2. 更新版本号 (让前端能看到变化)
 # 修改 app.js 中的版本号
-sed -i "s/global.CURRENT_VERSION = '.*';/global.CURRENT_VERSION = '$NEW_VERSION';/" app.js
+sed -i "s/global.CURRENT_VERSION = '.*';/global.CURRENT_VERSION = '13.16.1';/" app.js
 # 修改 package.json (如果存在)
 if [ -f "package.json" ]; then
-    sed -i 's/"version": ".*"/"version": "'$NEW_VERSION'"/' package.json
+    sed -i 's/"version": ".*"/"version": "13.16.1"/' package.json
 fi
 
-# 3. 覆盖 organizer.js (精准修改海报命名)
+# 3. 覆盖 organizer.js (精准修改海报命名: thumb.jpg, poster.jpg, fanart.jpg)
 cat > modules/organizer.js << 'EOF'
 const axios = require('axios');
 const cheerio = require('cheerio');
