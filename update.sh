@@ -1,26 +1,185 @@
 #!/bin/bash
-# VERSION = 13.16.2
+# VERSION = 13.16.3
 
-echo "🚀 [Update] 开始执行在线更新 v13.16.2 ..."
+echo "🚀 [Update] 开始执行跨版本更新 v13.16.3 ..."
 
 cd /app
 
 # 1. 更新版本号
-sed -i "s/global.CURRENT_VERSION = '.*';/global.CURRENT_VERSION = '13.16.2';/" app.js
+sed -i "s/global.CURRENT_VERSION = '.*';/global.CURRENT_VERSION = '13.16.3';/" app.js
 if [ -f "package.json" ]; then
-    sed -i 's/"version": ".*"/"version": "13.16.2"/' package.json
+    sed -i 's/"version": ".*"/"version": "13.16.3"/' package.json
 fi
 
-# 2. 修改采集器页数限制 (使用 sed 精准替换)
+# 2. 🔥 覆盖 API 路由 (修复搜索功能的核心)
+# 确保 /data 接口能正确接收 actor, category, keyword 参数
+cat > routes/api.js << 'EOF'
+const express = require('express');
+const axios = require('axios');
+const router = express.Router();
+const fs = require('fs');
+const { exec } = require('child_process');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+const { Parser } = require('json2csv');
+const Scraper = require('../modules/scraper');
+const ScraperXChina = require('../modules/scraper_xchina');
+const Renamer = require('../modules/renamer');
+const Organizer = require('../modules/organizer');
+const Login115 = require('../modules/login_115');
+const LoginM3U8 = require('../modules/login_m3u8'); 
+const ResourceMgr = require('../modules/resource_mgr');
+const AUTH_PASSWORD = process.env.AUTH_PASSWORD || "admin888";
 
-# MadouQu: 全量 500->10000, 增量 5->50
-sed -i 's/const maxPage = limit > 1000 ? 500 : 5;/const maxPage = limit > 1000 ? 10000 : 50;/' modules/scraper.js
+function compareVersions(v1, v2) {
+    if (!v1 || !v2) return 0;
+    const p1 = v1.split('.').map(Number);
+    const p2 = v2.split('.').map(Number);
+    for (let i = 0; i < Math.max(p1.length, p2.length); i++) {
+        const n1 = p1[i] || 0;
+        const n2 = p2[i] || 0;
+        if (n1 > n2) return 1;
+        if (n1 < n2) return -1;
+    }
+    return 0;
+}
 
-# xChina: 全量 5000->10000 (增量原本就是50，无需变动)
-sed -i "s/const limitPages = mode === 'full' ? 5000 : 50;/const limitPages = mode === 'full' ? 10000 : 50;/" modules/scraper_xchina.js
+router.get('/check-auth', (req, res) => { res.json({ authenticated: req.headers['authorization'] === AUTH_PASSWORD }); });
+router.post('/login', (req, res) => { if (req.body.password === AUTH_PASSWORD) res.json({ success: true }); else res.json({ success: false, msg: "密码错误" }); });
+router.post('/config', (req, res) => { global.CONFIG = { ...global.CONFIG, ...req.body }; global.saveConfig(); if(LoginM3U8.setConfig) LoginM3U8.setConfig(global.CONFIG); res.json({ success: true }); });
 
+router.get('/status', (req, res) => {
+    let logs = Scraper.getState().logs;
+    let scraped = Scraper.getState().totalScraped;
+    if (ScraperXChina.getState().isRunning) {
+        logs = ScraperXChina.getState().logs;
+        scraped = ScraperXChina.getState().totalScraped;
+    }
+    const orgState = Organizer.getState ? Organizer.getState() : { queue: 0, logs: [], stats: {} };
+    res.json({ config: global.CONFIG, state: { isRunning: Scraper.getState().isRunning || ScraperXChina.getState().isRunning, logs, totalScraped: scraped }, renamerState: Renamer.getState(), organizerLogs: orgState.logs || [], organizerStats: orgState.stats || {}, version: global.CURRENT_VERSION });
+});
 
-# 3. 升级 ResourceMgr (支持筛选逻辑)
+router.get('/m3u8/check', async (req, res) => { try { LoginM3U8.setConfig(global.CONFIG); res.json(await LoginM3U8.checkConnection()); } catch (e) { res.json({ success: false, msg: e.message }); } });
+router.get('/115/check', async (req, res) => { const { uid, time, sign } = req.query; const result = await Login115.checkStatus(uid, time, sign); if (result.success && result.cookie) { global.CONFIG.cookie115 = result.cookie; global.saveConfig(); res.json({ success: true, msg: "登录成功", cookie: result.cookie }); } else { res.json(result); } });
+router.get('/115/qr', async (req, res) => { try { res.json({ success: true, data: await Login115.getQrCode() }); } catch (e) { res.json({ success: false, msg: e.message }); } });
+
+router.post('/start', (req, res) => {
+    const { type, source, categories } = req.body;
+    if (Scraper.getState().isRunning || ScraperXChina.getState().isRunning) return res.json({ success: false, msg: "运行中" });
+    if (source === 'xchina') { ScraperXChina.clearLogs(); ScraperXChina.start(type, false, categories); } 
+    else { Scraper.clearLogs(); Scraper.start(type === 'full' ? 50000 : 100, type, false); }
+    res.json({ success: true });
+});
+router.post('/stop', (req, res) => { Scraper.stop(); ScraperXChina.stop(); res.json({ success: true }); });
+
+router.post('/push', async (req, res) => {
+    const ids = req.body.ids || [];
+    const shouldOrganize = req.body.organize === true;
+    if (ids.length === 0) return res.json({ success: false, msg: "未选择" });
+    let successCount = 0;
+    try {
+        const items = await ResourceMgr.getByIds(ids);
+        for (const item of items) {
+            let pushed = false;
+            let magnet = item.magnets || '';
+            if (magnet.startsWith('m3u8|') || magnet.startsWith('pikpak|')) {
+                let targetUrl = item.link;
+                if (!targetUrl && magnet.includes('|http')) targetUrl = magnet.split('|')[1];
+                if (targetUrl && targetUrl.startsWith('http')) pushed = await LoginM3U8.addTask(targetUrl);
+            } 
+            else {
+                if (global.CONFIG.cookie115) {
+                    const dlResult = await Login115.addTask(magnet);
+                    if (dlResult) {
+                        pushed = true;
+                        if (shouldOrganize) Organizer.addTask(item);
+                    }
+                }
+            }
+            if (pushed) { successCount++; await ResourceMgr.markAsPushed(item.id); }
+            await new Promise(r => setTimeout(r, 500));
+        }
+        res.json({ success: true, count: successCount, msg: shouldOrganize ? "已推并加入刮削" : "已推送" });
+    } catch (e) { res.json({ success: false, msg: e.message }); }
+});
+
+router.post('/organize', async (req, res) => {
+    const ids = req.body.ids || [];
+    const items = await ResourceMgr.getByIds(ids);
+    let count = 0;
+    items.forEach(item => {
+        if (!item.magnets.startsWith('m3u8|')) { Organizer.addTask(item); count++; }
+    });
+    res.json({ success: true, count, msg: "已加入整理队列" });
+});
+
+router.post('/delete', async (req, res) => { const result = await ResourceMgr.deleteByIds(req.body.ids || []); res.json(result.success ? { success: true } : { success: false, msg: result.error }); });
+
+// ✅ 核心修复：透传所有筛选参数
+router.get('/data', async (req, res) => { 
+    const filters = { 
+        pushed: req.query.pushed || '', 
+        renamed: req.query.renamed || '',
+        actor: req.query.actor || '',
+        category: req.query.category || '',
+        keyword: req.query.keyword || ''
+    }; 
+    const result = await ResourceMgr.getList(parseInt(req.query.page) || 1, 100, filters); 
+    res.json(result); 
+});
+
+router.get('/export', async (req, res) => { try { const type = req.query.type || 'all'; let data = []; if (type === 'all') data = await ResourceMgr.getAllForExport(); else { const result = await ResourceMgr.getList(parseInt(req.query.page) || 1, 100); data = result.data; } const parser = new Parser({ fields: ['id', 'code', 'title', 'magnets', 'created_at'] }); const csv = parser.parse(data); res.header('Content-Type', 'text/csv'); res.attachment(`madou_${Date.now()}.csv`); return res.send(csv); } catch (err) { res.status(500).send("Err: " + err.message); } });
+
+router.post('/system/online-update', async (req, res) => {
+    const updateUrl = global.UPDATE_URL || 'https://raw.githubusercontent.com/ghostlpz/mdqupdate/refs/heads/main/update.sh';
+    const options = { timeout: 30000 };
+    if (global.CONFIG && global.CONFIG.proxy && global.CONFIG.proxy.startsWith('http')) {
+        const agent = new HttpsProxyAgent(global.CONFIG.proxy);
+        options.httpAgent = agent;
+        options.httpsAgent = agent;
+    }
+    const tempScriptPath = '/data/update_temp.sh';
+    const finalScriptPath = '/data/update.sh';
+    try {
+        console.log(`⬇️ 正在检查更新: ${updateUrl}`);
+        const response = await axios({ method: 'get', url: updateUrl, ...options, responseType: 'stream' });
+        const writer = fs.createWriteStream(tempScriptPath);
+        response.data.pipe(writer);
+        writer.on('finish', () => {
+            fs.readFile(tempScriptPath, 'utf8', (err, data) => {
+                if (err) return res.json({ success: false, msg: "脚本读取失败" });
+                const match = data.match(/#\s*VERSION\s*=\s*([0-9\.]+)/);
+                const remoteVersion = match ? match[1] : null;
+                const localVersion = global.CURRENT_VERSION || '0.0.0';
+                if (!remoteVersion) return res.json({ success: false, msg: "无版本信息" });
+                
+                console.log(`🔍 版本对比: ${localVersion} -> ${remoteVersion}`);
+                if (compareVersions(remoteVersion, localVersion) > 0) {
+                    fs.renameSync(tempScriptPath, finalScriptPath);
+                    res.json({ success: true, msg: `发现新版 V${remoteVersion}，正在升级...` });
+                    setTimeout(() => {
+                        exec(`chmod +x ${finalScriptPath} && sh ${finalScriptPath}`, (error, stdout, stderr) => {
+                            if (error) console.error(`❌ 升级失败: ${error.message}`);
+                            else {
+                                console.log(`✅ 升级完成，正在重启...`);
+                                try { fs.renameSync(finalScriptPath, finalScriptPath + '.bak'); } catch(e){}
+                                process.exit(0);
+                            }
+                        });
+                    }, 1000);
+                } else {
+                    fs.unlinkSync(tempScriptPath);
+                    res.json({ success: false, msg: `已是最新 (V${localVersion})` });
+                }
+            });
+        });
+        writer.on('error', (err) => { res.json({ success: false, msg: "下载失败" }); });
+    } catch (e) { res.json({ success: false, msg: "网络错误: " + e.message }); }
+});
+
+module.exports = router;
+EOF
+
+# 3. 覆盖 ResourceMgr (增强 SQL 过滤逻辑)
 cat > modules/resource_mgr.js << 'EOF'
 const { pool } = require('./db');
 
@@ -112,7 +271,7 @@ const ResourceMgr = {
     async markAsPushedByLink(link) { try { await pool.query('UPDATE resources SET is_pushed = 1 WHERE link = ?', [link]); } catch (e) {} },
     async markAsRenamedByTitle(title) { try { await pool.query('UPDATE resources SET is_renamed = 1 WHERE title = ?', [title]); } catch (e) {} },
 
-    // 🔥 升级：支持多维筛选
+    // 🔥 升级：多维筛选实现
     async getList(page, limit, filters = {}) {
         try {
             const offset = (page - 1) * limit;
@@ -134,7 +293,7 @@ const ResourceMgr = {
                 conditions.push("category LIKE ?");
                 values.push(`%${filters.category}%`);
             }
-            // 3. 关键词搜索 (标题或番号或演员)
+            // 3. 关键词搜索 (标题 OR 番号 OR 演员)
             if (filters.keyword) {
                 conditions.push("(title LIKE ? OR code LIKE ? OR actor LIKE ?)");
                 values.push(`%${filters.keyword}%`, `%${filters.keyword}%`, `%${filters.keyword}%`);
@@ -143,12 +302,10 @@ const ResourceMgr = {
             let whereClause = "";
             if (conditions.length > 0) whereClause = " WHERE " + conditions.join(" AND ");
 
-            // 查总数
             const countSql = `SELECT COUNT(*) as total FROM resources${whereClause}`;
             const [countRows] = await pool.query(countSql, values);
             const total = countRows[0].total;
 
-            // 查数据
             const dataSql = `SELECT * FROM resources${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`;
             values.push(parseInt(limit), parseInt(offset));
 
@@ -170,13 +327,13 @@ const ResourceMgr = {
 module.exports = ResourceMgr;
 EOF
 
+# 4. 修改采集页数 (使用 sed 精准调整，避免覆盖整个文件导致 Python 逻辑丢失风险)
+# MadouQu: 500->10000, 5->50
+sed -i 's/const maxPage = limit > 1000 ? 500 : 5;/const maxPage = limit > 1000 ? 10000 : 50;/' modules/scraper.js
+# xChina: 5000->10000
+sed -i "s/const limitPages = mode === 'full' ? 5000 : 50;/const limitPages = mode === 'full' ? 10000 : 50;/" modules/scraper_xchina.js
 
-# 4. 升级 API 路由 (放行新参数)
-# 使用 sed 替换 /data 接口定义，增加 keyword, actor, category 参数解析
-sed -i "s|const filters = { pushed: req.query.pushed || '', renamed: req.query.renamed || '' };|const filters = { pushed: req.query.pushed || '', renamed: req.query.renamed || '', actor: req.query.actor || '', category: req.query.category || '', keyword: req.query.keyword || '' };|" routes/api.js
-
-
-# 5. 升级前端 HTML (添加筛选栏)
+# 5. 覆盖前端 HTML (三层筛选栏布局)
 cat > public/index.html << 'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -238,13 +395,13 @@ cat > public/index.html << 'EOF'
         .cat-item.active { background:rgba(59,130,246,0.2); border-color:#3b82f6; color:#93c5fd; }
         .cat-item input { margin-right:6px; width:auto; accent-color:#3b82f6; }
 
-        /* 🔥 筛选工具栏样式 */
+        /* 🔥 三层筛选栏样式 */
         .filter-section { background: rgba(0,0,0,0.2); border-radius: 8px; padding: 15px; margin-bottom: 15px; border: 1px solid var(--border); }
-        .filter-row { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; flex-wrap: wrap; }
+        .filter-row { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; }
         .filter-row:last-child { margin-bottom: 0; }
-        .filter-input { flex: 1; min-width: 140px; background: rgba(0,0,0,0.3); border: 1px solid var(--border); color: #fff; padding: 8px; border-radius: 6px; font-size: 13px; }
+        .filter-input { background: rgba(0,0,0,0.3); border: 1px solid var(--border); color: #fff; padding: 8px; border-radius: 6px; font-size: 13px; }
         .filter-select { background: rgba(0,0,0,0.3); border: 1px solid var(--border); color: #fff; padding: 8px; border-radius: 6px; font-size: 13px; min-width: 100px; }
-        .filter-label { font-size: 12px; color: var(--text-sub); margin-right: 5px; }
+        .filter-label { font-size: 12px; color: var(--text-sub); width: 60px; text-align: right; margin-right: 5px; }
 
         @media (max-width: 768px) {
             body { flex-direction: column; }
@@ -270,6 +427,7 @@ cat > public/index.html << 'EOF'
             #cat-list { grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)) !important; }
             
             .filter-row { flex-direction: column; align-items: stretch; gap: 8px; }
+            .filter-label { text-align: left; width: auto; margin-bottom: -4px; color: var(--primary); font-weight: bold; }
         }
     </style>
 </head>
@@ -349,31 +507,30 @@ cat > public/index.html << 'EOF'
                 
                 <div class="filter-section">
                     <div class="filter-row">
-                        <input id="filter-keyword" class="filter-input" placeholder="🔍 搜标题/番号" onkeypress="if(event.key==='Enter') loadDb(1)">
-                        <input id="filter-actor" class="filter-input" placeholder="👤 搜演员" onkeypress="if(event.key==='Enter') loadDb(1)">
-                        <input id="filter-cat" class="filter-input" placeholder="🏷️ 搜厂牌/分类" onkeypress="if(event.key==='Enter') loadDb(1)">
+                        <span class="filter-label">🔍 搜索:</span>
+                        <input id="filter-keyword" class="filter-input" style="flex:1" placeholder="输入标题 / 番号 / 演员关键词..." onkeypress="if(event.key==='Enter') loadDb(1)">
                         <button class="btn btn-pri" onclick="loadDb(1)">查询</button>
                     </div>
-                    <div class="filter-row" style="justify-content: flex-start; gap: 20px;">
-                        <div style="display:flex;align-items:center;">
-                            <span class="filter-label">推送状态:</span>
+                    <div class="filter-row">
+                        <span class="filter-label">🏷️ 标签:</span>
+                        <input id="filter-actor" class="filter-input" style="flex:1" placeholder="指定演员" onkeypress="if(event.key==='Enter') loadDb(1)">
+                        <input id="filter-cat" class="filter-input" style="flex:1" placeholder="指定厂牌" onkeypress="if(event.key==='Enter') loadDb(1)">
+                    </div>
+                    <div class="filter-row" style="justify-content: space-between;">
+                        <div style="display:flex;gap:10px;align-items:center;flex:1">
+                            <span class="filter-label">📊 状态:</span>
                             <select id="filter-pushed" class="filter-select" onchange="loadDb(1)">
-                                <option value="">全部</option>
+                                <option value="">推送状态(全部)</option>
                                 <option value="1">✅ 已推送</option>
                                 <option value="0">⬜ 未推送</option>
                             </select>
-                        </div>
-                        <div style="display:flex;align-items:center;">
-                            <span class="filter-label">刮削状态:</span>
                             <select id="filter-renamed" class="filter-select" onchange="loadDb(1)">
-                                <option value="">全部</option>
+                                <option value="">刮削状态(全部)</option>
                                 <option value="1">✅ 已整理</option>
                                 <option value="0">⬜ 未整理</option>
                             </select>
                         </div>
-                        <div style="flex:1; text-align:right;">
-                            <button class="btn btn-sm btn-outline-secondary" onclick="resetFilters()" style="font-size:12px;padding:4px 8px;">🔄 重置条件</button>
-                        </div>
+                        <button class="btn btn-sm btn-outline-secondary" onclick="resetFilters()" style="font-size:12px;">🔄 重置</button>
                     </div>
                 </div>
 
@@ -488,7 +645,7 @@ cat > public/index.html << 'EOF'
 </html>
 EOF
 
-# 6. 升级前端 JS (适配筛选逻辑)
+# 6. 覆盖前端 JS (适配所有新参数)
 cat > public/js/app.js << 'EOF'
 let dbPage = 1;
 let qrTimer = null;
@@ -547,8 +704,7 @@ async function login() {
     if (data.success) { localStorage.setItem('token', p); document.getElementById('lock').classList.add('hidden'); } else { alert("密码错误"); }
 }
 
-// ✅ 渲染分类的核心函数 (UI Bug 修复点)
-// 生成 HTML 时，给 label 添加 .cat-item 类，并绑定 onchange 事件来实现蓝色选中效果
+// ✅ 渲染分类
 function renderCats() {
     const src = document.getElementById('scr-source').value;
     const area = document.getElementById('cat-area');
@@ -575,7 +731,7 @@ function toggleAllCats() {
         const targetState = !chks[0].checked;
         chks.forEach(c => {
             c.checked = targetState;
-            c.dispatchEvent(new Event('change')); // 触发视觉更新
+            c.dispatchEvent(new Event('change'));
         });
     }
 }
@@ -591,7 +747,6 @@ window.onload = async () => {
         if(document.getElementById('cfg-cookie')) document.getElementById('cfg-cookie').value = r.config.cookie115 || '';
         if(document.getElementById('cfg-flare')) document.getElementById('cfg-flare').value = r.config.flaresolverrUrl || '';
         if(document.getElementById('cfg-target-cid')) document.getElementById('cfg-target-cid').value = r.config.targetCid || '';
-        
         if(document.getElementById('cfg-m3u8-url')) document.getElementById('cfg-m3u8-url').value = r.config.m3u8_url || '';
         if(document.getElementById('cfg-m3u8-target')) document.getElementById('cfg-m3u8-target').value = r.config.m3u8_target || '';
         if(document.getElementById('cfg-m3u8-pwd')) document.getElementById('cfg-m3u8-pwd').value = r.config.m3u8_pwd || '';
@@ -786,4 +941,4 @@ async function loadDb(p) {
 }
 EOF
 
-echo "✅ 在线更新脚本 v13.16.2 已部署，系统将自动重启..."
+echo "✅ 在线更新脚本 v13.16.3 已部署，系统将自动重启..."
