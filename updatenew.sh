@@ -1,13 +1,18 @@
 #!/bin/sh
-# VERSION = 13.19.0
-# Madou Omni - Cloud Auth Integration (Full Business Logic Preserved)
+# VERSION = 13.19.1
+# Madou Omni - Cloud Auth with Proxy Support
+# ---------------------------------------------------------
+# 1. 后端: api.js (增加代理支持，读取 process.env.PROXY_URL)
+# 2. 前端: index.html (登录遮罩)
+# 3. 前端: app.js (拦截逻辑)
+# ---------------------------------------------------------
 
 set -e
 
-echo "🚀 [Update] 开始升级 v13.19.0 (云端验证集成版)..."
+echo "🚀 [Update] 开始升级 v13.19.1 (代理修复版)..."
 
 # =========================================================
-# 1. 备份 (以防万一)
+# 1. 备份
 # =========================================================
 echo "📦 [Backup] 备份核心文件..."
 cp /app/routes/api.js /app/routes/api.js.bak.$(date +%s)
@@ -15,9 +20,9 @@ cp /app/public/js/app.js /app/public/js/app.js.bak.$(date +%s)
 cp /app/public/index.html /app/public/index.html.bak.$(date +%s)
 
 # =========================================================
-# 2. 重写 app/routes/api.js (植入云验证 + 保留业务)
+# 2. 重写 api.js (植入云验证 + 代理支持)
 # =========================================================
-echo "🔧 [Backend] 更新 api.js (接入 maddd.store)..."
+echo "🔧 [Backend] 更新 api.js (集成代理)..."
 
 cat > /app/routes/api.js << 'EOF'
 const express = require('express');
@@ -29,7 +34,7 @@ const { exec } = require('child_process');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const { Parser } = require('json2csv');
 
-// 📦 保持原有的模块引入
+// 📦 保持原有业务模块
 const Scraper = require('../modules/scraper');
 const ScraperXChina = require('../modules/scraper_xchina');
 const Renamer = require('../modules/renamer');
@@ -39,17 +44,16 @@ const LoginM3U8 = require('../modules/login_m3u8');
 const ResourceMgr = require('../modules/resource_mgr');
 
 // ==========================================
-// 🛡️ 云端验证配置 (Cloud Auth Config)
+// 🛡️ 云端验证配置
 // ==========================================
 const CLOUD_API_BASE = 'http://maddd.store:30009/api';
 const HEARTBEAT_INTERVAL = 60 * 1000;
 const CONFIG_PATH = '/data/config.json';
 
-// 全局状态
 global.IS_LOGGED_IN = false;
 if (!global.CONFIG) global.CONFIG = {};
 
-// 辅助函数
+// 辅助函数：保存配置
 function saveConfigLocal(newConf) {
     if (global.saveConfig) {
         global.CONFIG = { ...global.CONFIG, ...newConf };
@@ -73,8 +77,23 @@ function getDeviceToken() {
     return global.CONFIG.deviceToken;
 }
 
+// 🔥 [核心] 获取代理配置
+function getAxiosConfig(timeout = 10000) {
+    // 优先读取 Docker 环境变量，其次读取 Config 文件
+    const proxyUrl = process.env.PROXY_URL || global.CONFIG.proxy;
+    const config = { timeout };
+    
+    if (proxyUrl && proxyUrl.startsWith('http')) {
+        // console.log(`🔌 Using Proxy: ${proxyUrl}`);
+        const agent = new HttpsProxyAgent(proxyUrl);
+        config.httpAgent = agent;
+        config.httpsAgent = agent;
+    }
+    return config;
+}
+
 // ==========================================
-// 📡 核心：登录与心跳
+// 📡 登录与心跳 (带代理)
 // ==========================================
 
 router.post('/login', async (req, res) => {
@@ -83,9 +102,12 @@ router.post('/login', async (req, res) => {
 
     try {
         console.log(`📡 [Auth] Connecting: ${username}`);
-        const response = await axios.post(`${CLOUD_API_BASE}/login`, {
-            username, password, clientToken: myToken
-        }, { timeout: 10000 });
+        // 使用带代理的配置
+        const response = await axios.post(
+            `${CLOUD_API_BASE}/login`, 
+            { username, password, clientToken: myToken }, 
+            getAxiosConfig(10000)
+        );
 
         const data = response.data;
         if (data.success) {
@@ -99,7 +121,8 @@ router.post('/login', async (req, res) => {
             res.json({ success: false, msg: data.msg });
         }
     } catch (e) {
-        res.json({ success: false, msg: "验证服务器连接失败" });
+        console.error(`⚠️ [Auth Error] ${e.message}`);
+        res.json({ success: false, msg: "验证服务器连接失败 (请检查代理)" });
     }
 });
 
@@ -109,9 +132,11 @@ async function sendHeartbeat() {
     const myNonce = global.CONFIG.nonce;
 
     try {
-        const res = await axios.post(`${CLOUD_API_BASE}/heartbeat`, {
-            clientToken: myToken, clientNonce: myNonce
-        }, { timeout: 5000 });
+        const res = await axios.post(
+            `${CLOUD_API_BASE}/heartbeat`, 
+            { clientToken: myToken, clientNonce: myNonce }, 
+            getAxiosConfig(5000)
+        );
 
         const data = res.data;
         if (data.action === 'OK' && data.nextNonce) {
@@ -121,7 +146,9 @@ async function sendHeartbeat() {
             global.IS_LOGGED_IN = false;
             saveConfigLocal({ authToken: null });
         }
-    } catch (e) { console.warn(`⚠️ [Heartbeat] Lost: ${e.message}`); }
+    } catch (e) { 
+        console.warn(`⚠️ [Heartbeat] Lost: ${e.message}`); 
+    }
 }
 setInterval(sendHeartbeat, HEARTBEAT_INTERVAL);
 
@@ -168,7 +195,7 @@ router.get('/status', (req, res) => {
     if (ScraperXChina.getState().isRunning) { logs = ScraperXChina.getState().logs; scraped = ScraperXChina.getState().totalScraped; }
     const orgState = Organizer.getState ? Organizer.getState() : { queue: 0, logs: [], stats: {} };
     res.json({ 
-        loggedIn: global.IS_LOGGED_IN, // 关键字段
+        loggedIn: global.IS_LOGGED_IN, 
         config: { ...global.CONFIG, deviceToken: global.CONFIG.deviceToken }, 
         state: { isRunning: Scraper.getState().isRunning || ScraperXChina.getState().isRunning, logs, totalScraped: scraped }, 
         renamerState: Renamer.getState(), 
@@ -191,7 +218,6 @@ router.post('/start', (req, res) => {
 });
 router.post('/stop', (req, res) => { Scraper.stop(); ScraperXChina.stop(); res.json({ success: true }); });
 
-// 🔥 [关键] 保留您的 Push 逻辑
 router.post('/push', async (req, res) => {
     const ids = req.body.ids || [];
     const shouldOrganize = req.body.organize === true;
@@ -203,8 +229,7 @@ router.post('/push', async (req, res) => {
         for (const item of items) {
             let pushed = false;
             let magnet = (item.magnets || '').trim();
-            let link = (item.link || '').trim();
-
+            
             if (magnet.startsWith('magnet:?')) {
                 if (global.CONFIG.cookie115) {
                     if (await Login115.addTask(magnet)) {
@@ -213,7 +238,7 @@ router.post('/push', async (req, res) => {
                     }
                 }
             } else {
-                let targetUrl = link;
+                let targetUrl = item.link || '';
                 if (magnet.startsWith('m3u8|') || magnet.startsWith('pikpak|')) {
                     const parts = magnet.split('|');
                     if (parts.length > 1 && parts[1].startsWith('http')) targetUrl = parts[1];
@@ -249,6 +274,7 @@ router.get('/data', async (req, res) => {
 
 router.get('/export', async (req, res) => { try { const type = req.query.type || 'all'; let data = []; if (type === 'all') data = await ResourceMgr.getAllForExport(); else { const result = await ResourceMgr.getList(parseInt(req.query.page) || 1, 100); data = result.data; } const parser = new Parser({ fields: ['id', 'code', 'title', 'magnets', 'created_at'] }); const csv = parser.parse(data); res.header('Content-Type', 'text/csv'); res.attachment(`madou_${Date.now()}.csv`); return res.send(csv); } catch (err) { res.status(500).send("Err: " + err.message); } });
 
+// 在线更新 (使用 getAxiosConfig 获取代理)
 router.post('/system/online-update', async (req, res) => {
     const myToken = getDeviceToken();
     const whitelistUrl = dec(ENC_WHITE);
@@ -258,16 +284,19 @@ router.post('/system/online-update', async (req, res) => {
     
     try {
         console.log(`⬇️ Update Check...`);
-        const options = { timeout: 30000 };
-        if (global.CONFIG && global.CONFIG.proxy) {
-            const agent = new HttpsProxyAgent(global.CONFIG.proxy);
-            options.httpAgent = agent; options.httpsAgent = agent;
-        }
-        const whiteRes = await axios.get(whitelistUrl, options);
-        // 放宽验证
-        const response = await axios({ method: 'get', url: scriptUrl, ...options, responseType: 'stream' });
+        // 使用 getAxiosConfig 获取代理配置
+        const options = getAxiosConfig(30000); 
+        options.responseType = 'stream'; // 下载需要 stream
+
+        // 第一次请求白名单 (这里不需要 stream，但 getAxiosConfig 也没副作用)
+        const whiteOpts = getAxiosConfig(15000);
+        const whiteRes = await axios.get(whitelistUrl, whiteOpts);
+        
+        // 下载脚本
+        const response = await axios({ method: 'get', url: scriptUrl, ...options });
         const writer = fs.createWriteStream(tempScriptPath);
         response.data.pipe(writer);
+        
         writer.on('finish', () => {
             fs.readFile(tempScriptPath, 'utf8', (err, data) => {
                 if (err) return res.json({ success: false, msg: "Read Error" });
@@ -292,27 +321,21 @@ module.exports = router;
 EOF
 
 # =========================================================
-# 3. 更新 app/public/index.html (注入遮罩)
+# 3. 智能修补 index.html
 # =========================================================
 echo "🎨 [Frontend] 更新 index.html..."
 
-# 插入遮罩层代码到 body 开始处
 OVERLAY='<div id="login-overlay" style="position:fixed;inset:0;background:rgba(15,23,42,0.98);z-index:10000;display:flex;justify-content:center;align-items:center;backdrop-filter:blur(10px);display:none;"><div class="card" style="width:380px;padding:40px;background:#1e293b;border:1px solid rgba(255,255,255,0.1);box-shadow:0 25px 50px -12px rgba(0,0,0,0.5);"><div style="text-align:center;margin-bottom:30px;"><div style="font-size:32px;margin-bottom:10px;">⚡</div><h2 style="margin:0;color:#fff;">Madou Omni</h2><p style="color:#64748b;font-size:14px;margin-top:5px;">安全终端登录</p></div><div class="input-group"><label>云端账号</label><input type="text" id="cloud-user" placeholder="Username" style="padding:12px;background:#0f172a;"></div><div class="input-group"><label>密码</label><input type="password" id="cloud-pass" placeholder="Password" style="padding:12px;background:#0f172a;"></div><div id="login-msg" style="color:#ef4444;font-size:13px;margin-bottom:15px;text-align:center;min-height:20px;"></div><button class="btn btn-pri" style="width:100%;padding:12px;font-size:16px;font-weight:600;" onclick="doCloudLogin()">登 录 / 激 活</button><div style="margin-top:20px;text-align:center;font-size:12px;color:#475569;">Protected by Rolling-Key™ Security</div></div></div>'
 
-# 检查是否已存在
 if ! grep -q "login-overlay" /app/public/index.html; then
     sed -i "s|<body>|<body>${OVERLAY}|" /app/public/index.html
-    # 隐藏旧锁
     sed -i 's|id="lock"|id="lock" class="hidden"|' /app/public/index.html
 fi
 
 # =========================================================
-# 4. 更新 app/public/js/app.js (注入拦截逻辑)
+# 4. 更新 app.js
 # =========================================================
 echo "🧠 [Frontend] 更新 app.js..."
-
-# 我们使用 cat 覆盖整个 app.js，因为原文件很复杂，替换头部更安全
-# 注意：这里我们小心地将您的 XCHINA_CATS 和所有函数都保留了
 
 cat > /app/public/js/app.js << 'EOF'
 let dbPage = 1; let qrTimer = null;
@@ -347,7 +370,6 @@ const XCHINA_CATS = [
     { name: "无关情色", code: "series-66643478ceedd" }
 ];
 
-// 🔥 [核心] 拦截 401 并显示遮罩
 async function request(ep, opt={}) {
     const t = localStorage.getItem('token'); const h = {'Content-Type':'application/json'}; if(t) h['Authorization']=t;
     try { 
@@ -360,7 +382,6 @@ async function request(ep, opt={}) {
 function showLogin() { document.getElementById('login-overlay').style.display='flex'; }
 function hideLogin() { document.getElementById('login-overlay').style.display='none'; }
 
-// 🔥 [核心] 云端登录
 async function doCloudLogin() {
     const u=document.getElementById('cloud-user').value; const p=document.getElementById('cloud-pass').value;
     const btn=event.target; const msg=document.getElementById('login-msg');
@@ -375,17 +396,11 @@ async function doCloudLogin() {
     finally{ btn.disabled=false; btn.innerText="登录 / 激活"; }
 }
 
-// 初始化逻辑：检查云端状态
 window.onload = async () => {
-    // 隐藏旧锁
     const oldLock = document.getElementById('lock'); if(oldLock) oldLock.classList.add('hidden');
-    
-    // 检查云端
     try {
         const s = await request('status');
         if (s.loggedIn) hideLogin(); else showLogin();
-        
-        // 回显配置
         if(s.config){
             if(s.config.proxy) document.getElementById('cfg-proxy').value=s.config.proxy;
             if(s.config.cookie115) document.getElementById('cfg-cookie').value=s.config.cookie115;
@@ -398,19 +413,16 @@ window.onload = async () => {
         }
         if(s.version) document.getElementById('cur-ver').innerText="V"+s.version;
     } catch(e) { showLogin(); }
-    
     renderCats();
 };
 
-// ... 以下保持原有的所有业务函数 ...
-async function login() { } // 留空，已被取代
+async function login() { }
 function renderCats() {
     const src=document.getElementById('scr-source').value; const area=document.getElementById('cat-area'); const list=document.getElementById('cat-list');
     if(src==='xchina'){ area.classList.remove('hidden'); if(list.innerHTML.trim()==='') list.innerHTML=XCHINA_CATS.map(c=>`<label class="cat-item active" style="margin-bottom:0"><input type="checkbox" class="cat-chk" value="${c.code}" checked onchange="this.parentElement.classList.toggle('active',this.checked)"> ${c.name}</label>`).join(''); } else { area.classList.add('hidden'); }
 }
 function toggleAllCats() { const chks=document.querySelectorAll('.cat-chk'); if(chks.length>0){ const s=!chks[0].checked; chks.forEach(c=>{c.checked=s;c.dispatchEvent(new Event('change'));}); } }
 function copyToken() { const v=document.getElementById('device-token').innerText; if(v&&v!=='读取中...') {navigator.clipboard.writeText(v); alert('✅ 授权码已复制');} }
-
 function show(id) {
     document.querySelectorAll('.page').forEach(e=>e.classList.add('hidden')); document.getElementById(id).classList.remove('hidden');
     document.querySelectorAll('.nav-item').forEach(e=>e.classList.remove('active')); if(event&&event.target) event.target.closest('.nav-item').classList.add('active');
@@ -503,7 +515,7 @@ async function showQr() {
 EOF
 
 # =========================================================
-# 5. 重启
+# 5. 完成
 # =========================================================
 echo "🔄 升级完成，正在重启服务..."
 pkill -f "node app.js" || true
